@@ -108,7 +108,7 @@ export function DogPanel() {
             onChange={(e) => setDog({ volume_db: Number(e.target.value) })}
             className="flex-1"
           />
-          <span className="font-mono w-14 text-right">{dog.volume_db.toFixed(1)} dB</span>
+          <span className="font-mono w-14 text-right whitespace-nowrap">{dog.volume_db.toFixed(1)} dB</span>
         </label>
         <label
           className="flex items-center gap-1.5 text-[10px] text-dim"
