@@ -95,8 +95,8 @@ export function DogPanel() {
         />
       </div>
 
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-3">
-        <label className="flex-1 min-w-36 flex items-center gap-2 text-[10px] text-dim">
+      <div className="flex items-center gap-3 mt-3">
+        <label className="flex items-center gap-2 text-[10px] text-dim whitespace-nowrap">
           Volume
           <input
             type="range"
@@ -106,12 +106,12 @@ export function DogPanel() {
             value={dog.volume_db}
             disabled={!dog.enabled}
             onChange={(e) => setDog({ volume_db: Number(e.target.value) })}
-            className="flex-1"
+            className="w-20"
           />
           <span className="font-mono w-14 text-right whitespace-nowrap">{dog.volume_db.toFixed(1)} dB</span>
         </label>
         <label
-          className="flex items-center gap-1.5 text-[10px] text-dim"
+          className="flex items-center gap-1.5 text-[10px] text-dim whitespace-nowrap ml-auto"
           title="Off = never barks. Deliberate previews never bark either."
         >
           <input
