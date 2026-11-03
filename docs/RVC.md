@@ -36,15 +36,21 @@ Cable A carries the raw RVC voice into DefReal. Cable B carries the *processed*
 voice to your apps. If you ever connect a cable's input straight back to its own
 output you create a loop — Windows won't stop you, your ears will. Keep A ≠ B.
 
-## Hearing yourself
+## Hearing yourself (Direct Monitor — v0.1.1)
 
-Pick **headphones** as the DefReal output instead of cable B if you just want to
-monitor. For processed-out AND monitoring, either:
+Since v0.1.1 DefReal has a built-in second output. On the **Routing** tab:
 
-- Set output = cable B and use the target app's own monitoring (Discord: voice
-  settings → input sensitivity / OBS: advanced audio → monitoring), or
-- Use VoiceMeeter: send DefReal to a VAIO input, then VoiceMeeter buses it to
-  both cable B and your headphones.
+1. **Send to** stays on cable B (your apps' input).
+2. In **Direct Monitor**, pick your real headphones, tick **Enable**.
+
+The same processed signal now goes to cable B *and* your headphones — no
+external repeater (VoiceMeeter etc.) needed. Monitor has its own gain (starts
+at −18 dB) and mute; neither affects the cable output. If the headphones get
+unplugged, monitoring stops but the cable feed keeps running.
+
+If you pick a suspicious combination (monitor = cable B, or monitor = your
+capture device), DefReal shows a warning rather than silently doubling audio
+or looping the cable.
 
 ## Other sources
 

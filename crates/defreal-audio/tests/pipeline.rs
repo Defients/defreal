@@ -235,3 +235,193 @@ fn motion_commands_flow_through() {
     let d = r.pump.chain_mut().motion_debug().distance_m;
     assert!(d > 0.34, "distance {d}");
 }
+
+// --- v0.1.1 regression tests -------------------------------------------------
+
+/// The v0.1 loop discarded `recv_timeout` results when idle — commands sent
+/// while the pump had no work vanished. dispatch() is now the single handler;
+/// every command type must reach engine state.
+#[test]
+fn idle_commands_are_dispatched() {
+    use defreal_audio::engine::dispatch;
+    use defreal_audio::{EngineCommand, MonitorConfig};
+
+    let mut r = rig(48000, 48000);
+    // pump idle: no input queued. Commands must still land in engine state.
+    dispatch(EngineCommand::TriggerMotion(defreal_dsp::MotionState::LeanBack), &mut r.pump, &r.telemetry);
+    // now pump audio; the debug snapshot refreshes inside process()
+    push_all(&mut r, &sine_at(48000, 220.0, 0.3, 4800));
+    for _ in 0..4 { r.pump.tick(); }
+    let d = r.pump.chain_mut().motion_debug();
+    assert!(
+        d.target_distance_m > 0.34 || d.state != defreal_dsp::MotionState::Neutral,
+        "TriggerMotion lost: {d:?}"
+    );
+
+    dispatch(
+        EngineCommand::SetManualPositionTimed(
+            defreal_dsp::PositionState { distance_m: 1.0, azimuth_deg: 20.0, facing_deg: 5.0 },
+            0.3,
+        ),
+        &mut r.pump, &r.telemetry,
+    );
+    push_all(&mut r, &sine_at(48000, 220.0, 0.3, 4800));
+    for _ in 0..4 { r.pump.tick(); }
+    let d = r.pump.chain_mut().motion_debug();
+    assert!(d.manual, "SetManualPosition lost");
+
+    dispatch(EngineCommand::ReleaseManualTimed(0.5), &mut r.pump, &r.telemetry);
+    dispatch(
+        EngineCommand::SetMonitor(MonitorConfig { enabled: true, device: None, gain_db: -18.0, muted: false }),
+        &mut r.pump, &r.telemetry,
+    );
+    let s = r.telemetry.snapshot(None);
+    assert_eq!(s.monitor_state, "disabled", "enabled monitor without attach must not claim active");
+}
+
+/// One DSP pass, two destinations: the monitor branch must receive the same
+/// processed stereo content as the main branch (after its own resampler).
+#[test]
+fn dual_output_fanout_equivalent_signal() {
+    let (mon_prod, mut mon_cons) = HeapRb::<f32>::new(96000).split();
+    let mut r = rig(48000, 48000);
+    let branch = defreal_audio::MonitorBranch::for_test(mon_prod, 48000, 2, 0.0).unwrap();
+    r.pump.attach_monitor(branch);
+    r.pump.set_monitor_cfg(defreal_audio::MonitorConfig {
+        enabled: true, device: Some("test".into()), gain_db: 0.0, muted: false,
+    });
+
+    let input = sine_at(48000, 220.0, 0.3, 48000);
+    push_all(&mut r, &input);
+    for _ in 0..600 {
+        r.pump.tick();
+        if mon_cons.occupied_len() > 8000 && r.out_cons.occupied_len() > 8000 { break; }
+    }
+    let mut main = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { main.push(s); }
+    let mut mon = Vec::new();
+    while let Some(s) = mon_cons.try_pop() { mon.push(s); }
+    assert!(main.len() > 2000 && mon.len() > 1000, "main {} mon {}", main.len(), mon.len());
+    // same program content: correlate energy — both carry the 220 Hz sine
+    assert!(rms(&mon[mon.len() / 2..]) > 0.005, "monitor silent");
+    assert!(rms(&main[main.len() / 2..]) > 0.005, "main silent");
+}
+
+/// A stalled monitor (nobody drains its ring) must not starve the main output.
+#[test]
+fn stalled_monitor_does_not_block_main() {
+    let (mon_prod, _mon_cons) = HeapRb::<f32>::new(8192).split(); // tiny, fills fast
+    let mut r = rig(48000, 48000);
+    r.pump.attach_monitor(defreal_audio::MonitorBranch::for_test(mon_prod, 48000, 2, 0.0).unwrap());
+    r.pump.set_monitor_cfg(defreal_audio::MonitorConfig {
+        enabled: true, device: None, gain_db: 0.0, muted: false,
+    });
+    let input = sine_at(48000, 220.0, 0.3, 48000);
+    push_all(&mut r, &input);
+    for _ in 0..600 {
+        r.pump.tick();
+        if r.out_cons.occupied_len() > 8000 { break; }
+    }
+    let mut main = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { main.push(s); }
+    assert!(main.len() > 2000, "monitor stall blocked main: {}", main.len());
+    assert!(rms(&main[main.len() / 2..]) > 0.01);
+}
+
+/// Muted monitor yields silence on its ring while the main output keeps signal.
+#[test]
+fn monitor_mute_isolated() {
+    let (mon_prod, mut mon_cons) = HeapRb::<f32>::new(96000).split();
+    let mut r = rig(48000, 48000);
+    r.pump.attach_monitor(defreal_audio::MonitorBranch::for_test(mon_prod, 48000, 2, 0.0).unwrap());
+    r.pump.set_monitor_cfg(defreal_audio::MonitorConfig {
+        enabled: true, device: None, gain_db: 0.0, muted: true,
+    });
+    let input = sine_at(48000, 220.0, 0.3, 48000);
+    push_all(&mut r, &input);
+    for _ in 0..600 {
+        r.pump.tick();
+        if r.out_cons.occupied_len() > 8000 { break; }
+    }
+    let mut mon = Vec::new();
+    while let Some(s) = mon_cons.try_pop() { mon.push(s); }
+    let mut main = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { main.push(s); }
+    assert!(main.len() > 2000);
+    assert!(rms(&main) > 0.005, "main dead");
+    // monitor rb is prefilled with zeros then receives silence — all zeros
+    assert!(mon.iter().all(|s| s.abs() < 1e-6), "muted monitor leaked audio");
+}
+
+/// Monitor at a different device rate (44.1k): own resampler must feed it.
+#[test]
+fn monitor_different_rate() {
+    let (mon_prod, mut mon_cons) = HeapRb::<f32>::new(96000).split();
+    let mut r = rig(48000, 48000);
+    r.pump.attach_monitor(defreal_audio::MonitorBranch::for_test(mon_prod, 44100, 2, 0.0).unwrap());
+    r.pump.set_monitor_cfg(defreal_audio::MonitorConfig {
+        enabled: true, device: None, gain_db: 0.0, muted: false,
+    });
+    let input = sine_at(48000, 220.0, 0.3, 48000);
+    push_all(&mut r, &input);
+    for _ in 0..800 {
+        r.pump.tick();
+        if mon_cons.occupied_len() > 6000 { break; }
+    }
+    let mut mon = Vec::new();
+    while let Some(s) = mon_cons.try_pop() { mon.push(s); }
+    assert!(mon.len() > 1000, "monitor @44.1k got {}", mon.len());
+    assert!(rms(&mon[mon.len() / 2..]) > 0.005);
+}
+
+/// Gain staging: -18 dB monitor vs 0 dB main — monitor energy ~1/64 of main.
+#[test]
+fn monitor_gain_independent() {
+    let (mon_prod, mut mon_cons) = HeapRb::<f32>::new(96000).split();
+    let mut r = rig(48000, 48000);
+    r.pump.attach_monitor(defreal_audio::MonitorBranch::for_test(mon_prod, 48000, 2, -18.0).unwrap());
+    r.pump.set_monitor_cfg(defreal_audio::MonitorConfig {
+        enabled: true, device: None, gain_db: -18.0, muted: false,
+    });
+    let input = sine_at(48000, 220.0, 0.3, 96000); // long enough to settle the ramp
+    push_all(&mut r, &input);
+    for _ in 0..800 {
+        r.pump.tick();
+        if mon_cons.occupied_len() > 16000 && r.out_cons.occupied_len() > 16000 { break; }
+    }
+    let mut mon = Vec::new();
+    while let Some(s) = mon_cons.try_pop() { mon.push(s); }
+    let mut main = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { main.push(s); }
+    let mr = rms(&mon[mon.len() * 3 / 4..]);
+    let rr = rms(&main[main.len() * 3 / 4..]);
+    assert!(mr > 0.0005 && rr > 0.005, "mon {mr} main {rr}");
+    assert!(mr < rr * 0.4, "-18dB monitor not attenuated: mon {mr} main {rr}");
+}
+
+/// MoveThenRelease must land the move BEFORE releasing to automation —
+/// an immediate release would clobber the requested target.
+#[test]
+fn move_then_release_sequences() {
+    use defreal_audio::engine::dispatch;
+    use defreal_audio::EngineCommand;
+    let mut r = rig(48000, 48000);
+    dispatch(
+        EngineCommand::MoveThenRelease(
+            defreal_dsp::PositionState { distance_m: 1.4, azimuth_deg: -15.0, facing_deg: 0.0 },
+            0.4, 1.0, 0.8,
+        ),
+        &mut r.pump, &r.telemetry,
+    );
+    // pump the motion clock: feed a little audio so ticks happen
+    let input = vec![0.0f32; 4800];
+    push_all(&mut r, &input);
+    for _ in 0..4 { r.pump.tick(); std::thread::sleep(std::time::Duration::from_millis(30)); }
+    let d = r.pump.chain_mut().motion_debug();
+    // either still moving toward 1.4 (manual) or already released — but the
+    // distance must be heading to 1.4, not snapped back to neutral.
+    assert!(
+        d.target_distance_m > 0.9 || d.distance_m > 0.5,
+        "move_then_release target lost: {d:?}"
+    );
+}

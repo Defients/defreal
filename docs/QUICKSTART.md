@@ -41,17 +41,27 @@ already common in RVC setups).
 
 Result: RVC voice → DefReal realism → apps hear the processed signal.
 
-Monitoring yourself: additionally select your real headphones as the output, or
-use OBS's audio monitoring. Keep the DefReal→OBS cable separate from the
-RVC→DefReal cable.
+Monitoring yourself: enable **Direct Monitor** on the Routing tab and pick your
+real headphones — the processed signal plays on the cable AND your headphones
+at once. Monitor gain starts at −18 dB; its mute/volume are independent of the
+main output. Keep the DefReal→OBS cable separate from the RVC→DefReal cable.
 
-## 4. Natural Motion
+## 4. Live Presence Stage
 
-- On the **PERFORM** tab, the top-down view shows the mic (violet diamond) and
-  your virtual speaker position (cyan dot). Distance rings are 0.25 / 0.5 / 1 / 2 m.
+- On the **PERFORM** tab, the stage shows the mic (violet diamond, bottom) and
+  your virtual speaker (cyan dot). Distance rings are 0.25 / 0.5 / 1 / 1.5 / 2 m.
+- **Drag the dot**: closer = more close-mic presence, farther = more room,
+  sideways = off-axis coloration. Changes are audible immediately.
+- **Arrow keys** nudge the speaker; **Home** returns to neutral.
+- **AUTO**: automation roams; dragging temporarily overrides, release glides
+  back. **TOUCH**: same but always returns on release. **LATCH**: the speaker
+  stays where you drop it until you resume automation.
+- **Actions** — Lean In / Lean Back / Turn Away / Across Room / Return /
+  Freeze: one-tap acoustic moves on the same position the dot shows.
+- **Snapshots** — Intimate / Conversational / Distant + your own (*save as…*).
+  Recall glides to the position; it never touches your mic model, ambience,
+  or routing.
 - The graph below shows distance over the last 30 s.
-- In **Proximity**, switch Position mode to **Manual** to drag the distance /
-  azimuth yourself — or click *Release → Auto* to hand control back.
 - Motion trigger buttons (lean-in, lean-back, turn-aside, reposition) queue a
   move; with *Speech-aware* on, the move waits for a pause in your voice.
 

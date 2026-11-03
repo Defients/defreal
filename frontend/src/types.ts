@@ -33,6 +33,10 @@ export interface Telemetry {
   motion_state: MotionStateName;
   motion_distance_m: number;
   motion_target_m: number;
+  motion_azimuth_deg: number;
+  motion_facing_deg: number;
+  motion_target_azimuth_deg: number;
+  motion_target_facing_deg: number;
   motion_progress: number;
   motion_age_s: number;
   motion_manual: boolean;
@@ -41,15 +45,39 @@ export interface Telemetry {
   out_rate: number;
   in_channels: number;
   out_channels: number;
+  monitor_state: "disabled" | "opening" | "active" | "error";
+  monitor_fill: number;
+  monitor_underflows: number;
+  monitor_rms_db: number;
+  monitor_peak_db: number;
+  monitor_gain_db: number;
+  monitor_muted: boolean;
+  monitor_rate: number;
+  monitor_channels: number;
+  monitor_device: string;
+  monitor_error: string | null;
 }
 
 export interface DeviceInfo {
   name: string;
+  id: string;
   is_default: boolean;
   min_rate: number;
   max_rate: number;
   default_channels: number;
   default_rate: number;
+}
+
+export type MotionMode = "auto" | "touch" | "latch";
+
+export interface SnapshotMeta {
+  name: string;
+  factory: boolean;
+  distance_m: number;
+  azimuth_deg: number;
+  facing_deg: number;
+  transition_s: number;
+  mode_after: string;
 }
 
 export type MicProfile =
@@ -138,6 +166,12 @@ export interface AppConfig {
   prebuffer_ms: number;
   reduced_motion: boolean;
   window: [number, number] | null;
+  monitor_enabled: boolean;
+  monitor_device: string | null;
+  monitor_gain_db: number;
+  monitor_muted: boolean;
+  motion_mode: string;
+  touch_return_s: number;
 }
 
 export interface RenderReport {

@@ -110,6 +110,8 @@ pub struct MotionEngine {
     dwell: f32,            // seconds left in state before next decision
     cooldown: f32,         // min time after transition before re-deciding
     pending: Option<(MotionState, f32)>, // (state, max_wait_s)
+    /// (seconds until auto-release, release duration) set by move_then_release
+    pending_release: Option<(f32, f32)>,
     time: f32,
     manual: bool,
     manual_pos: PositionState,
@@ -130,6 +132,7 @@ impl MotionEngine {
             dwell: 6.0,
             cooldown: 0.0,
             pending: None,
+            pending_release: None,
             time: 0.0,
             manual: false,
             manual_pos: PositionState::NEUTRAL,
@@ -142,17 +145,50 @@ impl MotionEngine {
         self.rng = Rng::new(seed);
     }
 
-    /// Take manual control (automation paused).
+    /// Take manual control (automation paused). Fast 0.12s glide so
+    /// continuous calls (UI drags) track the pointer without lag.
     pub fn set_manual(&mut self, pos: PositionState) {
-        self.manual = true;
-        self.manual_pos = pos;
-        self.begin_transition_to(pos, MotionState::Reposition, 1.2);
+        self.set_manual_timed(pos, 0.12);
     }
 
-    /// Resume automation at neutral.
+    /// Manual control with an explicit glide duration. Used for scripted
+    /// acoustic actions and snapshot recalls that should move deliberately
+    /// rather than track a pointer.
+    pub fn set_manual_timed(&mut self, pos: PositionState, dur_s: f32) {
+        self.manual = true;
+        self.manual_pos = pos;
+        self.begin_transition_to(pos, MotionState::Reposition, dur_s.max(0.05));
+    }
+
+    /// Resume automation: glide back to neutral, then autonomous decisions
+    /// continue from there.
     pub fn release_manual(&mut self) {
+        self.release_manual_timed(1.6);
+    }
+
+    /// Resume automation with a configurable return duration (TOUCH mode).
+    pub fn release_manual_timed(&mut self, dur_s: f32) {
         self.manual = false;
-        self.begin_transition_to(PositionState::NEUTRAL, MotionState::ReturnToNeutral, 1.6);
+        self.begin_transition_to(
+            PositionState::NEUTRAL,
+            MotionState::ReturnToNeutral,
+            dur_s.max(0.05),
+        );
+    }
+
+    /// Hold the current position (Freeze action): latch manual at wherever
+    /// the speaker currently is.
+    pub fn freeze(&mut self) {
+        self.set_manual_timed(self.current, 0.35);
+    }
+
+    /// Timed manual move, then automatically return to automation after the
+    /// move completes plus `hold_s`. Used for snapshot recall in "auto" mode
+    /// and one-shot acoustic actions (touch semantics, engine-side so the
+    /// ordering survives command timing).
+    pub fn move_then_release(&mut self, pos: PositionState, move_dur_s: f32, hold_s: f32, release_dur_s: f32) {
+        self.set_manual_timed(pos, move_dur_s);
+        self.pending_release = Some((move_dur_s + hold_s.max(0.0), release_dur_s));
     }
 
     /// Force a state (UI "trigger" buttons / tests).
@@ -275,6 +311,16 @@ impl MotionEngine {
         if self.manual {
             self.advance_transition(dt, p.speed);
             self.current = self.from.lerp(&self.manual_pos, ease(self.transition_pos));
+            // scheduled release (move_then_release)
+            if let Some((wait, dur)) = self.pending_release {
+                let wait = wait - dt;
+                if wait <= 0.0 {
+                    self.pending_release = None;
+                    self.release_manual_timed(dur);
+                } else {
+                    self.pending_release = Some((wait, dur));
+                }
+            }
             return self.current;
         }
 
@@ -380,6 +426,10 @@ impl MotionEngine {
             state: self.state,
             distance_m: self.current.distance_m,
             target_distance_m: self.target.distance_m,
+            azimuth_deg: self.current.azimuth_deg,
+            facing_deg: self.current.facing_deg,
+            target_azimuth_deg: self.target.azimuth_deg,
+            target_facing_deg: self.target.facing_deg,
             transition_progress: self.transition_pos,
             seconds_since_transition: self.seconds_since_transition(),
             manual: self.manual,
@@ -393,6 +443,12 @@ pub struct MotionDebug {
     pub state: MotionState,
     pub distance_m: f32,
     pub target_distance_m: f32,
+    /// applied speaker azimuth, degrees off mic axis
+    pub azimuth_deg: f32,
+    /// applied speaker facing rotation, degrees
+    pub facing_deg: f32,
+    pub target_azimuth_deg: f32,
+    pub target_facing_deg: f32,
     pub transition_progress: f32,
     pub seconds_since_transition: f32,
     pub manual: bool,

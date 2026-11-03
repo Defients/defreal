@@ -4,21 +4,28 @@
 //!   - CPAL input callback:  convert to f32 mono -> push input ring buffer
 //!                           (no alloc, no locks, bounded drop on overflow)
 //!   - Processing thread:    drain input rb -> resample to 48k -> DspChain
-//!                           -> resample to device rate -> output rb
+//!                           -> resample per branch -> output rb(s)
 //!                           (all DSP + alloc happens here, NOT in a callback)
 //!   - CPAL output callback: pop interleaved f32 -> device buffer
 //!                           (zero-fill + counter on underflow)
 //!
+//! ONE processed signal, TWO output branches. The monitor branch gets its own
+//! staging buffer, resampler, drift control and lifecycle — it can never starve
+//! or block the main output. Monitor streams are opened on a worker thread so
+//! a slow/failed device open never stalls the live pump.
+//!
 //! Param changes go through an ArcSwap snapshot; event commands through an
-//! mpsc channel consumed by the processing thread.
+//! mpsc channel consumed by the processing thread. Commands are NEVER dropped:
+//! recv_timeout results are dispatched like any other.
 
 use crate::device;
 use crate::resample::{InputResampler, OutputResampler};
-use crate::telemetry::{BufferStats, EngineState, SharedTelemetry};
+use crate::telemetry::{BufferStats, EngineState, MonitorState, SharedTelemetry};
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use defreal_dsp::motion::{MotionState, PositionState};
+use defreal_dsp::smooth::SmoothedParam;
 use defreal_dsp::{ChainParams, DspChain};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
@@ -53,6 +60,16 @@ impl Default for EngineConfig {
     }
 }
 
+/// Direct-monitor (second output) configuration. Device identity is the
+/// disambiguated `DeviceInfo::id` ("name" or "name#n").
+#[derive(Clone, Debug, Default)]
+pub struct MonitorConfig {
+    pub enabled: bool,
+    pub device: Option<String>,
+    pub gain_db: f32,
+    pub muted: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("{0}")]
@@ -70,10 +87,20 @@ pub enum EngineError {
 pub enum EngineCommand {
     TriggerMotion(MotionState),
     SetManualPosition(PositionState),
+    /// Timed manual move (acoustic actions / snapshot recall).
+    SetManualPositionTimed(PositionState, f32),
+    /// Timed move, hold, then auto-release to automation (engine-side sequencing).
+    MoveThenRelease(PositionState, f32, f32, f32),
     ReleaseManual,
+    /// Timed automation resume (TOUCH mode).
+    ReleaseManualTimed(f32),
+    /// Latch at the current position.
+    FreezeMotion,
     ResetChain,
     Reseed(u64),
     ResetCounters,
+    /// Reconfigure the monitor branch (device/gain/mute/enable).
+    SetMonitor(MonitorConfig),
 }
 
 pub struct AudioEngine {
@@ -144,8 +171,8 @@ impl AudioEngine {
         &self.config
     }
 
-    /// Start the engine. Blocks until streams are up or init fails
-    /// (bounded ~5s), so the caller knows the real outcome.
+    /// Start the engine. Blocks until streams AND the processing pump are
+    /// fully up (bounded ~5s), so the caller knows the real outcome.
     pub fn start(&mut self, config: EngineConfig) -> Result<(), EngineError> {
         if self.is_running() {
             return Err(EngineError::AlreadyRunning);
@@ -249,10 +276,7 @@ fn engine_thread(
     last_error: Arc<Mutex<Option<String>>>,
 ) {
     match build_streams(&config, &telemetry) {
-        Ok(io) => {
-            let _ = ready_tx.send(Ok("started".into()));
-            run_loop(config, io, cmd_rx, telemetry, params, stop, last_error);
-        }
+        Ok(io) => run_loop(config, io, cmd_rx, Some(ready_tx), telemetry, params, stop, last_error),
         Err(e) => {
             telemetry.set_state(EngineState::Failed);
             if let Ok(mut le) = last_error.lock() {
@@ -267,19 +291,15 @@ fn build_streams(
     config: &EngineConfig,
     telemetry: &Arc<SharedTelemetry>,
 ) -> Result<LoopIo, EngineError> {
-    eprintln!("[engine] resolving devices");
     let in_dev = device::find_input(config.input_device.as_deref())?;
     let out_dev = device::find_output(config.output_device.as_deref())?;
-    eprintln!("[engine] devices resolved");
 
     let in_supported = in_dev
         .default_input_config()
         .map_err(|e| EngineError::Stream(format!("input config: {e}")))?;
-    eprintln!("[engine] input cfg ok");
     let out_supported = out_dev
         .default_output_config()
         .map_err(|e| EngineError::Stream(format!("output config: {e}")))?;
-    eprintln!("[engine] output cfg ok");
 
     let in_cfg: StreamConfig = in_supported.clone().into();
     let out_cfg: StreamConfig = out_supported.clone().into();
@@ -297,20 +317,22 @@ fn build_streams(
         out_cfg.channels as u8,
     );
 
-    eprintln!("[engine] building input stream");
     let in_stream = build_input(&in_dev, &in_cfg, in_supported.sample_format(), in_prod, telemetry.clone())?;
-    eprintln!("[engine] building output stream");
-    let out_stream = build_output(&out_dev, &out_cfg, out_supported.sample_format(), out_cons, telemetry.clone())?;
+    let out_stream = build_output(
+        &out_dev,
+        &out_cfg,
+        out_supported.sample_format(),
+        out_cons,
+        telemetry.clone(),
+        OutBranch::Main,
+    )?;
 
-    eprintln!("[engine] play()");
     in_stream
         .play()
         .map_err(|e| EngineError::Stream(format!("input play: {e}")))?;
-    eprintln!("[engine] input playing");
     out_stream
         .play()
         .map_err(|e| EngineError::Stream(format!("output play: {e}")))?;
-    eprintln!("[engine] output playing");
 
     Ok(LoopIo {
         in_stream,
@@ -376,12 +398,22 @@ fn build_input(
 
 // --- output callback: ring buffer -> interleaved device buffer -------------
 
+/// Which output branch a stream belongs to — selects the underflow counter
+/// so main and monitor starvation are reported independently.
+#[derive(Clone, Copy)]
+pub enum OutBranch {
+    Main,
+    Monitor,
+}
+
+/// Generic stereo-interleaved output callback.
 fn build_output(
     dev: &cpal::Device,
     cfg: &StreamConfig,
     fmt: SampleFormat,
     mut cons: ringbuf::HeapCons<f32>,
     telemetry: Arc<SharedTelemetry>,
+    branch: OutBranch,
 ) -> Result<cpal::Stream, EngineError> {
     let ch = cfg.channels as usize;
     let err_tel = telemetry.clone();
@@ -401,7 +433,10 @@ fn build_output(
                         let l = match cons.try_pop() {
                             Some(v) => v,
                             None => {
-                                tel.output_underflows.fetch_add(1, Ordering::Relaxed);
+                                match branch {
+                                    OutBranch::Main => tel.output_underflows.fetch_add(1, Ordering::Relaxed),
+                                    OutBranch::Monitor => tel.mon_underflows.fetch_add(1, Ordering::Relaxed),
+                                };
                                 0.0
                             }
                         };
@@ -427,12 +462,161 @@ fn build_output(
     .map_err(|e| EngineError::Stream(format!("build output: {e}")))
 }
 
+// ---------------------------------------------------------------------------
+// monitor branch (second, independent output)
+// ---------------------------------------------------------------------------
+
+/// Everything the pump needs to feed a monitor stream. The stream itself is
+/// !Send (WASAPI COM object) so it is created and destroyed on its own
+/// worker thread — the engine holds only a MonitorHandle (stop signal +
+/// join handle), and the pump only ever holds the Send producer half.
+#[doc(hidden)]
+pub struct MonitorBranch {
+    prod: ringbuf::HeapProd<f32>,
+    mid_l: HeapRb<f32>,
+    mid_r: HeapRb<f32>,
+    res: OutputResampler,
+    chunk: usize,
+    rate: u32,
+    channels: u8,
+    gain: SmoothedParam,
+    // level metering (pump-side, cheap)
+    sum_sq: f64,
+    peak: f32,
+    cnt: u32,
+}
+
+/// Handle to a parked monitor-stream worker: signal stop + join (bounded).
+/// Lives on the engine thread next to the pump, NOT inside the branch.
+struct MonitorHandle {
+    stop_tx: Sender<()>,
+    join: JoinHandle<()>,
+}
+
+fn stop_monitor_handle(h: MonitorHandle) {
+    let _ = h.stop_tx.send(());
+    let t0 = Instant::now();
+    while !h.join.is_finished() && t0.elapsed() < Duration::from_millis(500) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if h.join.is_finished() {
+        let _ = h.join.join();
+    }
+}
+
+/// What the worker sends back on success (all Send): the producer half and
+/// stream format. The stream itself never crosses a thread boundary.
+struct MonitorReady {
+    prod: ringbuf::HeapProd<f32>,
+    rate: u32,
+    channels: u8,
+}
+
+/// Spawn the monitor worker. The returned handle stops it (and the stream).
+/// The worker opens the stream on ITS OWN thread — so the !Send stream is
+/// never moved — reports the Send parts, then parks until stopped.
+fn spawn_monitor_worker(
+    device_sel: Option<String>,
+    telemetry: Arc<SharedTelemetry>,
+    result_tx: Sender<(MonitorConfig, Result<MonitorReady, String>)>,
+    cfg_for_result: MonitorConfig,
+) -> Result<MonitorHandle, String> {
+    let (stop_tx, stop_rx) = channel::<()>();
+    let join = std::thread::Builder::new()
+        .name("defreal-monitor".into())
+        .spawn(move || {
+            let opened = (|| -> Result<(ringbuf::HeapProd<f32>, u32, u8, cpal::Stream), String> {
+                let dev = device::find_output(device_sel.as_deref()).map_err(|e| e.to_string())?;
+                let supported = dev
+                    .default_output_config()
+                    .map_err(|e| format!("monitor config: {e}"))?;
+                let cfg: StreamConfig = supported.clone().into();
+                let cap = (cfg.sample_rate.0 as usize / 4).max(4096) * 2;
+                let (prod, cons) = HeapRb::<f32>::new(cap.max(8192)).split();
+                let stream = build_output(
+                    &dev,
+                    &cfg,
+                    supported.sample_format(),
+                    cons,
+                    telemetry,
+                    OutBranch::Monitor,
+                )
+                .map_err(|e| e.to_string())?;
+                stream.play().map_err(|e| format!("monitor play: {e}"))?;
+                Ok((prod, cfg.sample_rate.0, cfg.channels as u8, stream))
+            })();
+
+            match opened {
+                Ok((prod, rate, channels, stream)) => {
+                    let _ = result_tx.send((
+                        cfg_for_result,
+                        Ok(MonitorReady { prod, rate, channels }),
+                    ));
+                    // park holding the stream; dropped here when stopped
+                    let _stream = stream;
+                    let _ = stop_rx.recv();
+                }
+                Err(e) => {
+                    let _ = result_tx.send((cfg_for_result, Err(e)));
+                }
+            }
+        })
+        .map_err(|e| format!("monitor thread: {e}"))?;
+    Ok(MonitorHandle { stop_tx, join })
+}
+
+impl MonitorBranch {
+    fn from_parts(parts: MonitorReady, gain_db: f32) -> Result<Self, EngineError> {
+        let chunk = (5.0 * 0.001 * parts.rate as f32).max(16.0) as usize;
+        let res = OutputResampler::new(parts.rate, INTERNAL_RATE, chunk)?;
+        let mid_cap = INTERNAL_RATE as usize / 2;
+        // prefill ~12 ms so playback starts without an underflow burst
+        let prefill = (parts.rate as f32 * 0.012) as usize;
+        let mut prod = parts.prod;
+        for _ in 0..prefill.min(prod.capacity().get() / 2) {
+            let _ = prod.try_push(0.0);
+            let _ = prod.try_push(0.0);
+        }
+        Ok(Self {
+            prod,
+            mid_l: HeapRb::new(mid_cap),
+            mid_r: HeapRb::new(mid_cap),
+            res,
+            chunk,
+            rate: parts.rate,
+            channels: parts.channels,
+            // start silent: ramping up on enable avoids a burst on headphones
+            gain: {
+                let mut g = SmoothedParam::new(0.0, 30.0, INTERNAL_RATE as f32);
+                g.set(defreal_dsp::envelope::from_db(gain_db.clamp(-60.0, 0.0)));
+                g
+            },
+            sum_sq: 0.0,
+            peak: 0.0,
+            cnt: 0,
+        })
+    }
+
+    /// Build a branch without a live stream (tests only): caller supplies the
+    /// producer half of a ring buffer it can drain to verify fan-out.
+    #[doc(hidden)]
+    pub fn for_test(
+        prod: ringbuf::HeapProd<f32>,
+        rate: u32,
+        channels: u8,
+        gain_db: f32,
+    ) -> Result<Self, EngineError> {
+        Self::from_parts(MonitorReady { prod, rate, channels }, gain_db)
+    }
+}
+
 // --- processing loop --------------------------------------------------------
 
 /// The stream-independent processing core: drains the input ring buffer,
-/// resamples to internal rate, runs the DspChain, resamples to output rate,
-/// fills the output ring buffer. Unit/integration tests drive `tick()`
-/// directly on synthetic ring buffers; the live loop just calls it.
+/// resamples to internal rate, runs the DspChain ONCE, fans the same stereo
+/// result out to the main output and (if attached) the monitor branch.
+/// Unit/integration tests drive `tick()` directly on synthetic ring buffers;
+/// the live loop just calls it.
 pub struct Pump {
     in_cons: ringbuf::HeapCons<f32>,
     out_prod: ringbuf::HeapProd<f32>,
@@ -443,6 +627,9 @@ pub struct Pump {
     chain: DspChain,
     telemetry: Arc<SharedTelemetry>,
     params: Arc<ArcSwap<ChainParams>>,
+    // monitor (optional second output)
+    mon: Option<MonitorBranch>,
+    mon_cfg: MonitorConfig,
     // preallocated scratch (allocated once, reused every tick)
     dev_in: Vec<f32>,
     res48: Vec<f32>,
@@ -451,6 +638,8 @@ pub struct Pump {
     ir: Vec<f32>,
     ol: Vec<f32>,
     or: Vec<f32>,
+    ml: Vec<f32>,
+    mr: Vec<f32>,
     in_capacity: usize,
     out_capacity: usize,
     in_chunk: usize,
@@ -489,6 +678,8 @@ impl Pump {
             chain: DspChain::new(INTERNAL_RATE as f32, seed),
             telemetry,
             params,
+            mon: None,
+            mon_cfg: MonitorConfig::default(),
             dev_in: vec![0.0; in_chunk],
             res48: Vec::with_capacity(block_frames * 4),
             interleaved: vec![0.0; block_frames * 4 * 2],
@@ -496,6 +687,8 @@ impl Pump {
             ir: vec![0.0; block_frames * 4],
             ol: vec![0.0; out_chunk],
             or: vec![0.0; out_chunk],
+            ml: vec![0.0; block_frames * 4],
+            mr: vec![0.0; block_frames * 4],
             in_capacity,
             out_capacity,
             in_chunk,
@@ -518,12 +711,87 @@ impl Pump {
         &mut self.chain
     }
 
-    /// One pump iteration: all queued input -> DSP -> staged -> output rb.
+    /// Attach a ready monitor branch (constructed off-thread).
+    #[doc(hidden)]
+    pub fn attach_monitor(&mut self, b: MonitorBranch) {
+        self.mon = Some(b);
+    }
+
+    /// Detach monitor stream + buffers (disable / device change).
+    pub fn detach_monitor(&mut self) {
+        self.mon = None;
+    }
+
+    /// Gain/mute/etc for the attached monitor (no stream rebuild).
+    pub fn set_monitor_cfg(&mut self, cfg: MonitorConfig) {
+        self.mon_cfg = cfg.clone();
+        if let Some(m) = &mut self.mon {
+            m.gain
+                .set(defreal_dsp::envelope::from_db(cfg.gain_db.clamp(-60.0, 0.0)));
+        }
+        self.telemetry
+            .set_monitor_gain(cfg.gain_db, cfg.muted || !cfg.enabled);
+    }
+
+    /// Drain one monitor chunk: staging -> resample -> gain/mute -> ring.
+    fn pump_monitor(&mut self) {
+        let Some(m) = &mut self.mon else { return };
+        let muted = self.mon_cfg.muted || !self.mon_cfg.enabled;
+        while m.mid_l.occupied_len() >= m.res.input_needed()
+            && m.prod.vacant_len() >= m.chunk * 2
+        {
+            let need = m.res.input_needed().min(self.ml.len());
+            for i in 0..need {
+                self.ml[i] = m.mid_l.try_pop().unwrap_or(0.0);
+                self.mr[i] = m.mid_r.try_pop().unwrap_or(0.0);
+            }
+            if m
+                .res
+                .process(&self.ml[..need], &self.mr[..need], &mut self.ol, &mut self.or)
+                .is_err()
+            {
+                self.telemetry.error_code.store(4, Ordering::Relaxed);
+                break;
+            }
+            // per-branch gain (ramped; mute -> gain 0) then push
+            for i in 0..m.chunk {
+                let g = if muted { 0.0 } else { m.gain.next() };
+                let l = self.ol[i] * g;
+                let r = self.or[i] * g;
+                let _ = m.prod.try_push(l);
+                let _ = m.prod.try_push(r);
+                // meter on the post-gain signal
+                m.sum_sq += ((l * l + r * r) * 0.5) as f64;
+                m.peak = m.peak.max(l.abs()).max(r.abs());
+                m.cnt += 1;
+            }
+            // drift control: keep monitor staging near the same 8ms target
+            let fill = m.mid_l.occupied_len() as f64;
+            let err = self.mid_target as f64 - fill;
+            m.res.set_drift_correction(err, 3.0);
+        }
+        // publish branch stats every tick it's attached
+        if m.cnt > 0 {
+            let rms = (m.sum_sq / m.cnt as f64).sqrt() as f32;
+            self.telemetry.publish_monitor(
+                m.prod.occupied_len() as f32 / m.prod.capacity().get() as f32,
+                defreal_dsp::envelope::to_db(rms),
+                defreal_dsp::envelope::to_db(m.peak),
+                m.rate as f32,
+                m.channels,
+            );
+            m.sum_sq = 0.0;
+            m.peak = 0.0;
+            m.cnt = 0;
+        }
+    }
+
+    /// One pump iteration: all queued input -> DSP -> staged -> output rb(s).
     /// Returns whether any work happened.
     pub fn tick(&mut self) -> bool {
         let mut did_work = false;
 
-        // --- input: device rate -> 48k -> DSP -> mid staging ---
+        // --- input: device rate -> 48k -> DSP -> mid staging (both branches) ---
         while self.in_cons.occupied_len() >= self.in_chunk {
             did_work = true;
             for s in self.dev_in.iter_mut() {
@@ -546,9 +814,19 @@ impl Pump {
             drop(p);
             let proc_us = t0.elapsed().as_micros() as f32;
 
+            // ONE processed signal fans out to every branch staging queue.
+            // Bounded: a stalled branch drops here, never blocks the others.
+            let has_mon = self.mon.is_some();
             for i in 0..n {
-                let _ = self.mid_l.try_push(self.interleaved[i * 2]);
-                let _ = self.mid_r.try_push(self.interleaved[i * 2 + 1]);
+                let l = self.interleaved[i * 2];
+                let r = self.interleaved[i * 2 + 1];
+                let _ = self.mid_l.try_push(l);
+                let _ = self.mid_r.try_push(r);
+                if has_mon {
+                    let m = self.mon.as_mut().unwrap();
+                    let _ = m.mid_l.try_push(l);
+                    let _ = m.mid_r.try_push(r);
+                }
             }
 
             let stats = BufferStats {
@@ -569,7 +847,7 @@ impl Pump {
                 .publish_block(&self.chain.metrics(), self.chain.motion_debug(), &stats, proc_us);
         }
 
-        // --- output: mid staging -> device rate -> out rb ---
+        // --- main output: mid staging -> device rate -> out rb ---
         while self.mid_l.occupied_len() >= self.out_res.input_needed()
             && self.out_prod.vacant_len() >= self.out_chunk * 2
         {
@@ -599,7 +877,47 @@ impl Pump {
             self.out_res.set_drift_correction(err, 3.0);
         }
 
+        // --- monitor output: independent staging -> own resampler -> own rb ---
+        if self.mon.is_some() {
+            self.pump_monitor();
+        }
+
         did_work
+    }
+}
+
+// --- command dispatch --------------------------------------------------------
+
+/// Central command handler — every command lands here exactly once.
+/// Extracted so the "dispatch commands received while idle" path is testable
+/// and identical to the hot path.
+#[doc(hidden)]
+pub fn dispatch(cmd: EngineCommand, pump: &mut Pump, telemetry: &Arc<SharedTelemetry>) {
+    match cmd {
+        EngineCommand::TriggerMotion(s) => pump.chain_mut().motion_mut().trigger(s),
+        EngineCommand::SetManualPosition(p) => {
+            pump.chain_mut().motion_mut().set_manual(p)
+        }
+        EngineCommand::SetManualPositionTimed(p, d) => {
+            pump.chain_mut().motion_mut().set_manual_timed(p, d)
+        }
+        EngineCommand::MoveThenRelease(p, md, hd, rd) => {
+            pump.chain_mut().motion_mut().move_then_release(p, md, hd, rd)
+        }
+        EngineCommand::ReleaseManual => pump.chain_mut().motion_mut().release_manual(),
+        EngineCommand::ReleaseManualTimed(d) => {
+            pump.chain_mut().motion_mut().release_manual_timed(d)
+        }
+        EngineCommand::FreezeMotion => pump.chain_mut().motion_mut().freeze(),
+        EngineCommand::ResetChain => pump.chain_mut().reset(),
+        EngineCommand::Reseed(s) => {
+            pump.chain_mut().reset();
+            pump.chain_mut().motion_mut().reseed(s);
+        }
+        EngineCommand::ResetCounters => telemetry.reset_counters(),
+        EngineCommand::SetMonitor(_) => {
+            // handled in run_loop (needs the open-result channel), never here
+        }
     }
 }
 
@@ -607,6 +925,7 @@ fn run_loop(
     config: EngineConfig,
     io: LoopIo,
     cmd_rx: Receiver<EngineCommand>,
+    ready_tx: Option<Sender<Result<String, EngineError>>>,
     telemetry: Arc<SharedTelemetry>,
     params: Arc<ArcSwap<ChainParams>>,
     stop: Arc<AtomicBool>,
@@ -643,37 +962,162 @@ fn run_loop(
             if let Ok(mut le) = last_error.lock() {
                 *le = Some(e.to_string());
             }
+            if let Some(rt) = &ready_tx {
+                let _ = rt.send(Err(e));
+            }
             return;
         }
     };
     pump.prefill(prebuffer_frames);
 
+    // Fully ready only now: streams live, pump built, buffer primed.
     telemetry.set_state(EngineState::Running);
+    if let Some(rt) = &ready_tx {
+        let _ = rt.send(Ok("started".into()));
+    }
+
+    // monitor open results arrive here from worker threads
+    let (mon_tx, mon_rx) = channel::<(MonitorConfig, Result<MonitorReady, String>)>();
+    // desired monitor config — gains/mute live-update without stream rebuild
+    let mut mon_cfg = MonitorConfig::default();
+    // handle to the parked monitor-stream worker (its stream never moves)
+    let mut mon_handle: Option<MonitorHandle> = None;
+    telemetry.set_monitor_state(MonitorState::Disabled);
 
     while !stop.load(Ordering::Relaxed) {
+        // 1) drain every queued command; SetMonitor routes to branch mgmt,
+        //    the rest dispatch into the pump.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                EngineCommand::TriggerMotion(s) => pump.chain_mut().motion_mut().trigger(s),
-                EngineCommand::SetManualPosition(p) => {
-                    pump.chain_mut().motion_mut().set_manual(p)
+            if let EngineCommand::SetMonitor(cfg) = cmd {
+                apply_monitor_cmd(
+                    cfg,
+                    &mut mon_cfg,
+                    &mut pump,
+                    &telemetry,
+                    &mon_tx,
+                    &mut mon_handle,
+                );
+            } else {
+                dispatch(cmd, &mut pump, &telemetry);
+            }
+        }
+
+        // 2) pick up finished monitor-open results (non-blocking)
+        while let Ok((cfg, res)) = mon_rx.try_recv() {
+            // stale result: user picked a different device while this opened
+            if cfg.device != mon_cfg.device || !mon_cfg.enabled {
+                continue; // stream dropped with `parts`
+            }
+            match res {
+                Ok(parts) => {
+                    let dev_name = cfg.device.clone().unwrap_or_default();
+                    match MonitorBranch::from_parts(parts, mon_cfg.gain_db) {
+                        Ok(b) => {
+                            pump.attach_monitor(b);
+                            pump.set_monitor_cfg(mon_cfg.clone());
+                            telemetry.set_monitor_device(dev_name);
+                            telemetry.set_monitor_state(MonitorState::Active);
+                        }
+                        Err(e) => {
+                            telemetry.set_monitor_error(dev_name, Some(e.to_string()));
+                            telemetry.set_monitor_state(MonitorState::Error);
+                        }
+                    }
                 }
-                EngineCommand::ReleaseManual => pump.chain_mut().motion_mut().release_manual(),
-                EngineCommand::ResetChain => pump.chain_mut().reset(),
-                EngineCommand::Reseed(s) => {
-                    pump.chain_mut().reset();
-                    pump.chain_mut().motion_mut().reseed(s);
+                Err(e) => {
+                    telemetry.set_monitor_error(
+                        cfg.device.clone().unwrap_or_default(),
+                        Some(e),
+                    );
+                    telemetry.set_monitor_state(MonitorState::Error);
                 }
-                EngineCommand::ResetCounters => telemetry.reset_counters(),
             }
         }
 
         if !pump.tick() {
-            // nothing to do: wait for input or a command
-            let _ = cmd_rx.recv_timeout(Duration::from_millis(2));
+            // nothing to do: wait for input or a command.
+            // FIX (v0.1.1): a command returned by recv_timeout was previously
+            // DISCARDED — commands sent while the pump idled were silently
+            // lost. Now we dispatch it like any other.
+            match cmd_rx.recv_timeout(Duration::from_millis(2)) {
+                Ok(EngineCommand::SetMonitor(cfg)) => apply_monitor_cmd(
+                    cfg,
+                    &mut mon_cfg,
+                    &mut pump,
+                    &telemetry,
+                    &mon_tx,
+                    &mut mon_handle,
+                ),
+                Ok(cmd) => dispatch(cmd, &mut pump, &telemetry),
+                Err(_) => {}
+            }
         }
     }
 
+    if let Some(h) = mon_handle.take() {
+        stop_monitor_handle(h);
+    }
     telemetry.set_state(EngineState::Idle);
+}
+
+/// Route a SetMonitor command: enable/device-change => async open on a worker
+/// thread (never blocks the pump); gain/mute => live-update the attached
+/// branch; disable => detach.
+fn apply_monitor_cmd(
+    cfg: MonitorConfig,
+    mon_cfg: &mut MonitorConfig,
+    pump: &mut Pump,
+    telemetry: &Arc<SharedTelemetry>,
+    mon_tx: &Sender<(MonitorConfig, Result<MonitorReady, String>)>,
+    mon_handle: &mut Option<MonitorHandle>,
+) {
+    let wants_active = cfg.enabled && cfg.device.is_some();
+    let device_changed = cfg.device != mon_cfg.device;
+
+    if !wants_active {
+        pump.detach_monitor();
+        if let Some(h) = mon_handle.take() {
+            stop_monitor_handle(h);
+        }
+        *mon_cfg = MonitorConfig {
+            enabled: false,
+            device: cfg.device,
+            gain_db: cfg.gain_db,
+            muted: cfg.muted,
+        };
+        pump.set_monitor_cfg(mon_cfg.clone());
+        telemetry.set_monitor_state(MonitorState::Disabled);
+        return;
+    }
+
+    // track the desired config immediately so late-arriving opens attach
+    // correctly and device-change detection stays stable
+    *mon_cfg = cfg.clone();
+
+    if device_changed || telemetry.monitor_state() != MonitorState::Active {
+        // stop any existing/pending worker first
+        pump.detach_monitor();
+        if let Some(h) = mon_handle.take() {
+            stop_monitor_handle(h);
+        }
+        telemetry.set_monitor_state(MonitorState::Opening);
+        telemetry.set_monitor_device(cfg.device.clone().unwrap_or_default());
+        match spawn_monitor_worker(
+            cfg.device.clone(),
+            telemetry.clone(),
+            mon_tx.clone(),
+            cfg.clone(),
+        ) {
+            Ok(h) => *mon_handle = Some(h),
+            Err(e) => {
+                telemetry.set_monitor_error(cfg.device.clone().unwrap_or_default(), Some(e));
+                telemetry.set_monitor_state(MonitorState::Error);
+            }
+        }
+    } else {
+        // same device, already active: just update gain/mute live
+        pump.set_monitor_cfg(cfg);
+    }
 }
 
 fn estimate_latency_ms(

@@ -29,14 +29,52 @@ export const api = {
       acknowledgedFeedback: acknowledged_feedback,
     }),
   engineStop: () => invoke<void>("engine_stop"),
+  engineRestart: (
+    input_device: string | null,
+    output_device: string | null,
+    block_ms?: number,
+    prebuffer_ms?: number,
+  ) =>
+    invoke<void>("engine_restart", {
+      inputDevice: input_device,
+      outputDevice: output_device,
+      blockMs: block_ms,
+      prebufferMs: prebuffer_ms,
+    }),
   engineState: () => invoke<Telemetry>("engine_state"),
   acknowledgeFeedback: () => invoke<void>("acknowledge_feedback"),
   paramsGet: () => invoke<ChainParams>("params_get"),
   paramsUpdate: (patch: unknown) => invoke<ChainParams>("params_update", { patch }),
   motionTrigger: (name: string) => invoke<void>("motion_trigger", { name }),
-  motionSetManual: (distance_m: number, azimuth_deg: number, facing_deg: number) =>
-    invoke<void>("motion_set_manual", { distanceM: distance_m, azimuthDeg: azimuth_deg, facingDeg: facing_deg }),
-  motionRelease: () => invoke<void>("motion_release"),
+  motionSetManual: (distance_m: number, azimuth_deg: number, facing_deg: number, durationS?: number) =>
+    invoke<void>("motion_set_manual", { distanceM: distance_m, azimuthDeg: azimuth_deg, facingDeg: facing_deg, durationS: durationS ?? null }),
+  motionRelease: (durationS?: number) =>
+    invoke<void>("motion_release", { durationS: durationS ?? null }),
+  motionFreeze: () => invoke<void>("motion_freeze"),
+  monitorSet: (enabled: boolean, device: string | null, gainDb: number, muted: boolean) =>
+    invoke<void>("monitor_set", { enabled, device, gainDb, muted }),
+  monitorCheck: (input: string, mainOut: string, monitor: string) =>
+    invoke<string | null>("monitor_check", { input, mainOut, monitor }),
+  snapshotsList: () => invoke<import("./types").SnapshotMeta[]>("snapshots_list"),
+  snapshotRecall: (name: string) =>
+    invoke<import("./types").SnapshotMeta>("snapshot_recall", { name }),
+  snapshotSave: (
+    name: string,
+    distanceM: number,
+    azimuthDeg: number,
+    facingDeg: number,
+    transitionS: number,
+    modeAfter: string,
+  ) =>
+    invoke<string>("snapshot_save", {
+      name,
+      distanceM,
+      azimuthDeg,
+      facingDeg,
+      transitionS,
+      modeAfter,
+    }),
+  snapshotDelete: (name: string) => invoke<void>("snapshot_delete", { name }),
   engineReset: () => invoke<void>("engine_reset"),
   presetsList: () => invoke<PresetMeta[]>("presets_list"),
   presetLoad: (name: string) => invoke<ChainParams>("preset_load", { name }),

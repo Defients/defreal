@@ -29,6 +29,32 @@ block and retry.
 - Press **BYPASS**: if bypass is audible but processed isn't, crank REALISM down
   and check the module toggles — something may be over-attenuating.
 
+## Direct Monitor problems (v0.1.1)
+
+- **Monitor delayed or stuttering**: the monitor branch has its own buffer and
+  resampler — a few ms of extra latency vs. the main output is normal.
+  Growing delay or crackle means the headphone device is falling behind:
+  check the monitor's underflow counter in the Routing tab. Re-pick the device
+  to rebuild the branch; raising Pre-buffer helps both branches.
+- **Monitor silently off**: enabling requires both **Enable** and a selected
+  monitor device. If the status shows `error`, the device failed to open
+  (exclusive mode elsewhere, unplugged) — fix and re-enable. The main output
+  is never interrupted by a monitor failure.
+- **Warning banner**: DefReal warns when monitor = main output (doubled audio),
+  monitor = capture device (feedback), or the monitor looks like the input's
+  virtual-cable partner. Pick a different headphone output or confirm the
+  routing is intentional.
+- **Volume too hot**: monitor gain defaults to −18 dB and ramps in over ~30 ms.
+  It never changes the main output level or DSP settings.
+
+## Missing device after update
+
+v0.1.1 identifies devices by name + occurrence index (`Name#2`) rather than
+position in the list. If Windows renames a device ("Headphones" → "Headset"),
+the stored selection no longer resolves — re-pick it on the Routing tab; the
+new name is saved. Duplicated names (two "Speakers") now resolve to distinct
+endpoints instead of always picking the first.
+
 ## Crackles / dropouts
 
 - ROUTING → raise **Pre-buffer** (e.g. 12 → 20–40 ms).

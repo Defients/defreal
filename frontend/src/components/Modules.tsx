@@ -97,7 +97,7 @@ export function ModulePanels() {
             <Slider label="Distance" value={manualD} min={0.1} max={2.5} step={0.01} unit=" m" violet onChange={(v) => { setManualD(v); setManual(v, manualAz, manualFacing); }} />
             <Slider label="Azimuth" value={manualAz} min={-90} max={90} step={1} unit="°" violet onChange={(v) => { setManualAz(v); setManual(manualD, v, manualFacing); }} />
             <Slider label="Facing" value={manualFacing} min={-90} max={90} step={1} unit="°" violet onChange={(v) => { setManualFacing(v); setManual(manualD, manualAz, v); }} />
-            <button className="btn text-[11px]" onClick={releaseManual}>Release → Auto</button>
+            <button className="btn text-[11px]" onClick={() => releaseManual()}>Release → Auto</button>
           </>
         ) : (
           <div className="text-[10px] text-faint">

@@ -1,6 +1,6 @@
 import { useStore } from "../store";
 import { Knob, Meter } from "./widgets";
-import { ProximityViz, MotionHistory } from "./ProximityViz";
+import { Stage, MotionHistory } from "./Stage";
 import { ModulePanels } from "./Modules";
 
 export function PerformTab() {
@@ -103,8 +103,7 @@ export function PerformTab() {
       {/* right: viz + modules */}
       <div className="space-y-3">
         <div className="panel p-4">
-          <div className="panel-title mb-2">Proximity — top-down</div>
-          <ProximityViz />
+          <Stage />
           <div className="mt-2">
             <MotionHistory />
           </div>

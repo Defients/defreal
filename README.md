@@ -28,7 +28,23 @@ The chain, applied live at 48 kHz internal rate:
 
 One **Natural Presence / Realism** macro (0–100) scales the whole system smoothly.
 0% is genuinely transparent (bit-transparent dry path); 100% is full processing.
-Hard **bypass** is instant and click-free.
+Bypass crossfades (~30 ms) so toggles are click-free and settle to exact dry.
+
+## What's new in v0.1.1 — LIVE PRESENCE
+
+- **Direct Monitor** — second independent output. Send processed audio to a
+  virtual cable AND hear it on your headphones at once, no external repeater.
+  Own device, gain (default −18 dB), mute, resampler, drift control and
+  telemetry. Monitor failures never touch the main output.
+- **Live Presence Stage** — the proximity view is now a controller: drag the
+  speaker around the mic (or nudge with arrow keys) and hear distance/off-axis
+  acoustics immediately. **AUTO / TOUCH / LATCH** arbitration, one-tap
+  **acoustic actions** (Lean In, Across Room, Turn Away…), and positional
+  **snapshots** (factory + user) with smooth recalls.
+- **Stabilization** — fixed engine commands silently dropped while idle;
+  START now waits for the whole pipeline before reporting ready; device
+  selection uses name+occurrence ids (`Name#2`) so duplicate device names
+  resolve correctly; stream errors surface as error codes in telemetry.
 
 ## Quick start
 
@@ -42,8 +58,9 @@ In the app:
 1. **ROUTING** tab → pick a capture device (input) and a playback device (output).
 2. Press **START**. Speak into the source; hear the processed result on the output.
 3. Turn the **REALISM** dial — 30–60 is the sweet spot.
-4. Watch the proximity view as Natural Motion moves the virtual speaker.
-5. **BYPASS** A/Bs instantly.
+4. Optionally enable **Direct Monitor** and pick headphones to hear yourself.
+5. **Drag the speaker** on the Live Presence Stage — closer = more presence.
+6. **BYPASS** A/Bs instantly.
 
 See **[docs/QUICKSTART.md](docs/QUICKSTART.md)** for routing recipes including
 RVC → DefReal → Discord/OBS, and **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
@@ -60,16 +77,21 @@ cargo run -p defreal-audio --example render -- in.wav out.wav "Lived-In Room" ab
 
 ## Verified status (honest)
 
-- ✅ 64 DSP unit tests + 9 synthetic pipeline tests pass (`cargo test --workspace`)
+- ✅ 65 DSP unit tests + 16 synthetic pipeline tests + 3 device tests pass
+  (`cargo test --workspace`)
+- ✅ Dual-output fan-out, monitor isolation/mute/gain/rate-mismatch, stalled-
+  monitor isolation, idle-command dispatch, and move-then-release sequencing
+  all covered by synthetic `Pump` tests — no real devices needed
 - ✅ Offline render verified: 98% of samples differ from input, level-matched A/B
-- ✅ Real device enumeration verified (all inputs/outputs listed)
+- ✅ Real device enumeration verified (all inputs/outputs listed, with
+  duplicate-name ids)
 - ✅ Real **playback** stream verified (opened + ran on Realtek speakers)
-- ✅ DSP cost measured: ~100 µs per 5 ms block (~2% of budget), ~50× realtime
 - ⚠️ Real **capture** stream could NOT be verified in the dev environment —
   every capture endpoint returned Windows `E_ACCESSDENIED (0x80070005)`
-  (environment sandboxing; playback works). The full duplex path is exercised
-  end-to-end by the synthetic `Pump` tests, but the first real-mic run on a
-  normal desktop is still the true gate.
+  (environment sandboxing; playback works). The monitor branch's live stream
+  was therefore also not opened against a real headphone device — its DSP-path
+  behavior is fully covered synthetically, but the first real dual-output run
+  on a normal desktop is still the true gate.
 - ⚠️ The installer's output artifacts are listed in the final report; running
   the installer itself was not performed.
 

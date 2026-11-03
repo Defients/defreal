@@ -5,7 +5,7 @@
 //! pushed via the "defreal://telemetry" event at ~15 Hz.
 
 use defreal_audio::device;
-use defreal_audio::engine::{AudioEngine, EngineCommand, EngineConfig};
+use defreal_audio::engine::{AudioEngine, EngineCommand, EngineConfig, MonitorConfig};
 use defreal_audio::offline::{render_ab, render_wav, AbResult, RenderReport};
 use defreal_audio::telemetry::TelemetrySnapshot;
 use defreal_dsp::motion::{MotionState, PositionState};
@@ -34,6 +34,9 @@ impl AppState {
     fn presets_dir(&self) -> PathBuf {
         self.data_dir.join("presets")
     }
+    fn snapshots_dir(&self) -> PathBuf {
+        self.data_dir.join("snapshots")
+    }
     fn config_path(&self) -> PathBuf {
         self.data_dir.join("config.json")
     }
@@ -53,6 +56,15 @@ pub struct AppConfig {
     pub prebuffer_ms: f32,
     pub reduced_motion: bool,
     pub window: Option<(u32, u32)>,
+    // direct monitor (defaults: disabled, conservative -18dB)
+    pub monitor_enabled: bool,
+    pub monitor_device: Option<String>,
+    pub monitor_gain_db: f32,
+    pub monitor_muted: bool,
+    // live presence stage motion mode: "auto" | "touch" | "latch"
+    pub motion_mode: String,
+    /// TOUCH-mode return-to-automation duration, seconds
+    pub touch_return_s: f32,
 }
 
 fn default_config() -> AppConfig {
@@ -60,6 +72,9 @@ fn default_config() -> AppConfig {
         last_preset: "Natural Presence".into(),
         block_ms: 5.0,
         prebuffer_ms: 12.0,
+        monitor_gain_db: -18.0,
+        motion_mode: "auto".into(),
+        touch_return_s: 1.6,
         ..Default::default()
     }
 }
@@ -107,6 +122,29 @@ fn engine_start(
 fn engine_stop(state: State<'_, AppState>) -> Result<(), String> {
     state.engine.lock().unwrap().stop();
     Ok(())
+}
+
+/// Controlled restart for device changes: stops and restarts with the new
+/// routing in one call so the UI never shows a stale "running" state.
+#[tauri::command]
+fn engine_restart(
+    state: State<'_, AppState>,
+    input_device: Option<String>,
+    output_device: Option<String>,
+    block_ms: Option<f32>,
+    prebuffer_ms: Option<f32>,
+) -> Result<(), String> {
+    {
+        state.engine.lock().unwrap().stop();
+    }
+    let mut eng = state.engine.lock().unwrap();
+    eng.start(EngineConfig {
+        input_device,
+        output_device,
+        block_ms: block_ms.unwrap_or(5.0),
+        prebuffer_ms: prebuffer_ms.unwrap_or(12.0),
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -174,20 +212,34 @@ fn motion_set_manual(
     distance_m: f32,
     azimuth_deg: f32,
     facing_deg: f32,
+    duration_s: Option<f32>,
 ) -> Result<(), String> {
-    state.engine.lock().unwrap().try_send(EngineCommand::SetManualPosition(
-        PositionState {
-            distance_m: distance_m.clamp(0.1, 3.0),
-            azimuth_deg: azimuth_deg.clamp(-90.0, 90.0),
-            facing_deg: facing_deg.clamp(-90.0, 90.0),
-        },
-    ));
+    let pos = PositionState {
+        distance_m: distance_m.clamp(0.1, 3.0),
+        azimuth_deg: azimuth_deg.clamp(-90.0, 90.0),
+        facing_deg: facing_deg.clamp(-90.0, 90.0),
+    };
+    let cmd = match duration_s {
+        Some(d) => EngineCommand::SetManualPositionTimed(pos, d.clamp(0.05, 10.0)),
+        None => EngineCommand::SetManualPosition(pos),
+    };
+    state.engine.lock().unwrap().try_send(cmd);
     Ok(())
 }
 
 #[tauri::command]
-fn motion_release(state: State<'_, AppState>) -> Result<(), String> {
-    state.engine.lock().unwrap().try_send(EngineCommand::ReleaseManual);
+fn motion_release(state: State<'_, AppState>, duration_s: Option<f32>) -> Result<(), String> {
+    let cmd = match duration_s {
+        Some(d) => EngineCommand::ReleaseManualTimed(d.clamp(0.05, 10.0)),
+        None => EngineCommand::ReleaseManual,
+    };
+    state.engine.lock().unwrap().try_send(cmd);
+    Ok(())
+}
+
+#[tauri::command]
+fn motion_freeze(state: State<'_, AppState>) -> Result<(), String> {
+    state.engine.lock().unwrap().try_send(EngineCommand::FreezeMotion);
     Ok(())
 }
 
@@ -430,6 +482,236 @@ fn feedback_check(input: String, output: String) -> Option<String> {
     device::feedback_warning(&input, &output)
 }
 
+// --- direct monitor -----------------------------------------------------------
+
+#[tauri::command]
+fn monitor_set(
+    state: State<'_, AppState>,
+    enabled: bool,
+    device: Option<String>,
+    gain_db: f32,
+    muted: bool,
+) -> Result<(), String> {
+    state.engine.lock().unwrap().try_send(EngineCommand::SetMonitor(
+        MonitorConfig {
+            enabled,
+            device,
+            gain_db: gain_db.clamp(-60.0, 0.0),
+            muted,
+        },
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn monitor_check(input: String, main_out: String, monitor: String) -> Option<String> {
+    device::monitor_warning(&input, &main_out, &monitor)
+}
+
+// --- acoustic snapshots --------------------------------------------------------
+//
+// Snapshots are lightweight spatial memories (position + transition + mode),
+// NOT full presets: they never touch module/routing/monitor settings.
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct Snapshot {
+    version: u32,
+    name: String,
+    factory: bool,
+    distance_m: f32,
+    azimuth_deg: f32,
+    facing_deg: f32,
+    /// glide time for recall
+    transition_s: f32,
+    /// "latch" holds position; "auto" releases to automation after the move
+    mode_after: String,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            name: String::new(),
+            factory: false,
+            distance_m: 0.32,
+            azimuth_deg: 0.0,
+            facing_deg: 0.0,
+            transition_s: 1.2,
+            mode_after: "latch".into(),
+        }
+    }
+}
+
+fn factory_snapshots() -> Vec<Snapshot> {
+    vec![
+        Snapshot {
+            name: "Intimate".into(),
+            factory: true,
+            distance_m: 0.18,
+            azimuth_deg: 0.0,
+            facing_deg: 0.0,
+            transition_s: 0.9,
+            mode_after: "latch".into(),
+            ..Default::default()
+        },
+        Snapshot {
+            name: "Conversational".into(),
+            factory: true,
+            distance_m: 0.34,
+            azimuth_deg: -4.0,
+            facing_deg: 0.0,
+            transition_s: 1.2,
+            mode_after: "latch".into(),
+            ..Default::default()
+        },
+        Snapshot {
+            name: "Distant".into(),
+            factory: true,
+            distance_m: 1.7,
+            azimuth_deg: 12.0,
+            facing_deg: 18.0,
+            transition_s: 1.8,
+            mode_after: "latch".into(),
+            ..Default::default()
+        },
+    ]
+}
+
+#[derive(Serialize)]
+struct SnapshotMeta {
+    name: String,
+    factory: bool,
+    distance_m: f32,
+    azimuth_deg: f32,
+    facing_deg: f32,
+    transition_s: f32,
+    mode_after: String,
+}
+
+fn snapshot_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .collect();
+    dir.join(format!("{}.json", safe.trim()))
+}
+
+fn load_snapshot_by_name(state: &AppState, name: &str) -> Result<Snapshot, String> {
+    if let Some(s) = factory_snapshots().into_iter().find(|s| s.name == name) {
+        return Ok(s);
+    }
+    let path = snapshot_path(&state.snapshots_dir(), name);
+    let text = fs::read_to_string(&path).map_err(|_| format!("snapshot not found: {name}"))?;
+    let s: Snapshot = serde_json::from_str(&text).map_err(|e| format!("bad snapshot: {e}"))?;
+    if s.version > 1 {
+        return Err(format!("unsupported snapshot version {}", s.version));
+    }
+    Ok(s)
+}
+
+#[tauri::command]
+fn snapshots_list(state: State<'_, AppState>) -> Result<Vec<SnapshotMeta>, String> {
+    let mut out: Vec<SnapshotMeta> = factory_snapshots()
+        .into_iter()
+        .map(|s| SnapshotMeta {
+            name: s.name,
+            factory: true,
+            distance_m: s.distance_m,
+            azimuth_deg: s.azimuth_deg,
+            facing_deg: s.facing_deg,
+            transition_s: s.transition_s,
+            mode_after: s.mode_after,
+        })
+        .collect();
+    let dir = state.snapshots_dir();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if e.path().extension().map(|x| x == "json").unwrap_or(false) {
+                if let Ok(text) = fs::read_to_string(e.path()) {
+                    if let Ok(s) = serde_json::from_str::<Snapshot>(&text) {
+                        out.push(SnapshotMeta {
+                            name: s.name,
+                            factory: false,
+                            distance_m: s.distance_m,
+                            azimuth_deg: s.azimuth_deg,
+                            facing_deg: s.facing_deg,
+                            transition_s: s.transition_s,
+                            mode_after: s.mode_after,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn snapshot_recall(state: State<'_, AppState>, name: String) -> Result<Snapshot, String> {
+    let s = load_snapshot_by_name(&state, &name)?;
+    let pos = PositionState {
+        distance_m: s.distance_m.clamp(0.1, 3.0),
+        azimuth_deg: s.azimuth_deg.clamp(-90.0, 90.0),
+        facing_deg: s.facing_deg.clamp(-90.0, 90.0),
+    };
+    let eng = state.engine.lock().unwrap();
+    if s.mode_after == "auto" {
+        // engine-side sequencing: move, hold briefly, glide back to automation
+        eng.try_send(EngineCommand::MoveThenRelease(pos, s.transition_s, 0.8, 1.6));
+    } else {
+        eng.try_send(EngineCommand::SetManualPositionTimed(pos, s.transition_s));
+    }
+    Ok(s)
+}
+
+#[tauri::command]
+fn snapshot_save(
+    state: State<'_, AppState>,
+    name: String,
+    distance_m: f32,
+    azimuth_deg: f32,
+    facing_deg: f32,
+    transition_s: f32,
+    mode_after: String,
+) -> Result<String, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("empty snapshot name".into());
+    }
+    if factory_snapshots().iter().any(|s| s.name == name) {
+        return Err("cannot overwrite a factory snapshot".into());
+    }
+    let s = Snapshot {
+        name: name.clone(),
+        factory: false,
+        distance_m: distance_m.clamp(0.1, 3.0),
+        azimuth_deg: azimuth_deg.clamp(-90.0, 90.0),
+        facing_deg: facing_deg.clamp(-90.0, 90.0),
+        transition_s: transition_s.clamp(0.1, 10.0),
+        mode_after: if mode_after == "auto" { "auto".into() } else { "latch".into() },
+        ..Default::default()
+    };
+    let dir = state.snapshots_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = snapshot_path(&dir, &name);
+    fs::write(&path, serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+fn snapshot_delete(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    if factory_snapshots().iter().any(|s| s.name == name) {
+        return Err("factory snapshots cannot be deleted".into());
+    }
+    let path = snapshot_path(&state.snapshots_dir(), &name);
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // --- config ------------------------------------------------------------------
 
 #[tauri::command]
@@ -482,6 +764,7 @@ pub fn run() {
             list_devices,
             engine_start,
             engine_stop,
+            engine_restart,
             engine_state,
             acknowledge_feedback,
             params_get,
@@ -489,6 +772,13 @@ pub fn run() {
             motion_trigger,
             motion_set_manual,
             motion_release,
+            motion_freeze,
+            monitor_set,
+            monitor_check,
+            snapshots_list,
+            snapshot_recall,
+            snapshot_save,
+            snapshot_delete,
             engine_reset,
             presets_list,
             preset_load,

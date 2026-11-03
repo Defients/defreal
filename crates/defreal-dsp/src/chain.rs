@@ -97,6 +97,8 @@ pub struct DspChain {
     out_gain: SmoothedParam,
     wet: SmoothedParam,
     room_send: SmoothedParam,
+    /// 0 = processing, 1 = bypassed. Ramped => click-free toggle.
+    bypass_gain: SmoothedParam,
 
     // scratch buffers (mono)
     dry_buf: Vec<f32>,
@@ -130,6 +132,7 @@ impl DspChain {
             out_gain: SmoothedParam::new(1.0, 20.0, sample_rate),
             wet: SmoothedParam::new(0.5, 25.0, sample_rate),
             room_send: SmoothedParam::new(1.0, 40.0, sample_rate),
+            bypass_gain: SmoothedParam::new(0.0, 5.0, sample_rate),
             dry_buf: vec![0.0; MAX_BLOCK],
             wet_buf: vec![0.0; MAX_BLOCK],
             direct_buf: vec![0.0; MAX_BLOCK],
@@ -142,6 +145,10 @@ impl DspChain {
                 state: crate::motion::MotionState::Neutral,
                 distance_m: 0.32,
                 target_distance_m: 0.32,
+                azimuth_deg: 0.0,
+                facing_deg: 0.0,
+                target_azimuth_deg: 0.0,
+                target_facing_deg: 0.0,
                 transition_progress: 1.0,
                 seconds_since_transition: 0.0,
                 manual: false,
@@ -156,6 +163,7 @@ impl DspChain {
     /// Stores the macro-adjusted *effective* params for the processing loop.
     fn update_params(&mut self, p: &ChainParams) {
         let e = realism::apply(p);
+        self.bypass_gain.set(if p.bypass { 1.0 } else { 0.0 });
         self.in_gain.set(from_db(e.input_gain_db));
         self.out_gain.set(from_db(e.output_gain_db));
         self.wet.set(realism::wet_dry(p));
@@ -179,12 +187,6 @@ impl DspChain {
         // metering on input
         self.in_meter.push_block(input);
 
-        if p.bypass {
-            self.route_bypass(input, out);
-            self.motion_debug = self.motion.debug();
-            return;
-        }
-
         let dt = n as f32 / self.sr;
         // speech estimation on raw (post-in-gain) signal, decimated by 4
         let g_in = self.in_gain.get();
@@ -193,9 +195,17 @@ impl DspChain {
         }
         let speech_open = self.gate.is_open();
         let speech_level = self.gate.level();
+        // motion keeps running under bypass so the stage stays truthful
         let pos = self.motion.update(dt, speech_open, speech_level, &self.eff.motion);
         self.proximity.update(&pos, &self.eff.proximity);
         self.room_send.set(self.proximity.derived.room_send);
+
+        // Fully settled bypass: pure dry copy, no DSP work, bit-transparent.
+        if self.bypass_gain.get() > 0.99999 && self.bypass_gain.is_settled() {
+            self.route_bypass(input, out);
+            self.motion_debug = self.motion.debug();
+            return;
+        }
 
         // --- per-sample ---
         let wet_on = self.wet.get() > 0.0005 || !self.wet.is_settled();
@@ -244,9 +254,13 @@ impl DspChain {
             r = self.limiter_r.process(r * g);
 
             let w = self.wet.next();
+            let bg = self.bypass_gain.next();
             let dry = self.dry_buf[i];
-            out[i * 2] = dry * (1.0 - w) + l * w;
-            out[i * 2 + 1] = dry * (1.0 - w) + r * w;
+            // dry coefficient: bypass overrides the wet/dry mix toward dry
+            let dco = bg + (1.0 - bg) * (1.0 - w);
+            let wco = w * (1.0 - bg);
+            out[i * 2] = dry * dco + l * wco;
+            out[i * 2 + 1] = dry * dco + r * wco;
             self.out_meter.push_frame(out[i * 2], out[i * 2 + 1]);
         }
 
@@ -347,10 +361,44 @@ mod tests {
         let p = ChainParams { bypass: true, ..Default::default() };
         let input = sine(512, 0.3, 48000.0);
         let mut out = vec![0.0; 1024];
-        c.process(&input, &mut out, &p);
+        // crossfade settles within ~5ms; once settled the path is pure dry
+        for _ in 0..4 {
+            c.process(&input, &mut out, &p);
+        }
         for i in 0..512 {
             assert_eq!(out[i * 2], input[i]);
             assert_eq!(out[i * 2 + 1], input[i]);
+        }
+    }
+
+    #[test]
+    fn bypass_toggle_has_no_discontinuity() {
+        // Engaging/disengaging bypass mid-signal must ramp, not jump.
+        // 100 Hz sine = exactly 1 cycle per 480-sample block -> input is
+        // continuous across block boundaries.
+        let mut c = DspChain::new(48000.0, 1);
+        let input = sine(480, 0.3, 48000.0);
+        let input: Vec<f32> = (0..480)
+            .map(|i| 0.3 * (2.0 * PI * 100.0 * i as f32 / 48000.0).sin())
+            .collect();
+        let mut out = vec![0.0; 960];
+        let mut on = ChainParams { realism: 1.0, ..Default::default() };
+        for _ in 0..10 {
+            c.process(&input, &mut out, &on);
+        }
+        let mut prev_l = out[479 * 2];
+        for direction in 0..2 {
+            on.bypass = direction == 0;
+            c.process(&input, &mut out, &on);
+            for i in 0..480 {
+                let s = out[i * 2];
+                let jump = (s - prev_l).abs();
+                assert!(
+                    jump < 0.12,
+                    "discontinuity {jump} at sample {i} (dir {direction})"
+                );
+                prev_l = s;
+            }
         }
     }
 

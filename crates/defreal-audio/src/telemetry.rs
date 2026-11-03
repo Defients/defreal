@@ -65,6 +65,10 @@ pub struct SharedTelemetry {
     motion_state: AtomicU8,
     motion_distance: AtomicF32,
     motion_target: AtomicF32,
+    motion_azimuth: AtomicF32,
+    motion_facing: AtomicF32,
+    motion_target_azimuth: AtomicF32,
+    motion_target_facing: AtomicF32,
     motion_progress: AtomicF32,
     motion_age: AtomicF32,
     motion_manual: AtomicBool,
@@ -74,6 +78,53 @@ pub struct SharedTelemetry {
     out_rate: AtomicF32,
     in_channels: AtomicU8,
     out_channels: AtomicU8,
+    // monitor (second output branch)
+    mon_state: AtomicU8,
+    mon_fill: AtomicF32,
+    pub mon_underflows: AtomicU64,
+    mon_rms_db: AtomicF32,
+    mon_peak_db: AtomicF32,
+    mon_gain_db: AtomicF32,
+    mon_muted: AtomicBool,
+    mon_rate: AtomicF32,
+    mon_channels: AtomicU8,
+    /// device name + last error; UI-thread only, never touched in RT callbacks
+    pub mon_meta: std::sync::Mutex<MonitorMeta>,
+}
+
+/// Stringy monitor info that can't live in atomics.
+#[derive(Clone, Debug, Default)]
+pub struct MonitorMeta {
+    pub device: String,
+    pub error: Option<String>,
+}
+
+/// Lifecycle of the independent monitor branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonitorState {
+    Disabled = 0,
+    Opening = 1,
+    Active = 2,
+    Error = 3,
+}
+
+impl MonitorState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Opening => "opening",
+            Self::Active => "active",
+            Self::Error => "error",
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Opening,
+            2 => Self::Active,
+            3 => Self::Error,
+            _ => Self::Disabled,
+        }
+    }
 }
 
 struct AtomicF32(AtomicU64);
@@ -113,6 +164,10 @@ impl SharedTelemetry {
             motion_state: AtomicU8::new(0),
             motion_distance: AtomicF32(AtomicU64::new(0.32f32.to_bits() as u64)),
             motion_target: AtomicF32(AtomicU64::new(0.32f32.to_bits() as u64)),
+            motion_azimuth: AtomicF32(AtomicU64::new(0)),
+            motion_facing: AtomicF32(AtomicU64::new(0)),
+            motion_target_azimuth: AtomicF32(AtomicU64::new(0)),
+            motion_target_facing: AtomicF32(AtomicU64::new(0)),
             motion_progress: AtomicF32(AtomicU64::new((1.0f32).to_bits() as u64)),
             motion_age: AtomicF32(AtomicU64::new(0)),
             motion_manual: AtomicBool::new(false),
@@ -121,6 +176,16 @@ impl SharedTelemetry {
             out_rate: AtomicF32(AtomicU64::new(0)),
             in_channels: AtomicU8::new(0),
             out_channels: AtomicU8::new(0),
+            mon_state: AtomicU8::new(MonitorState::Disabled as u8),
+            mon_fill: AtomicF32(AtomicU64::new(0)),
+            mon_underflows: AtomicU64::new(0),
+            mon_rms_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
+            mon_peak_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
+            mon_gain_db: AtomicF32(AtomicU64::new((-18.0f32).to_bits() as u64)),
+            mon_muted: AtomicBool::new(false),
+            mon_rate: AtomicF32(AtomicU64::new(0)),
+            mon_channels: AtomicU8::new(0),
+            mon_meta: std::sync::Mutex::new(MonitorMeta::default()),
         }
     }
 
@@ -162,6 +227,10 @@ impl SharedTelemetry {
         self.motion_state.store(motion_state_u8(dbg.state), Ordering::Relaxed);
         self.motion_distance.store(dbg.distance_m);
         self.motion_target.store(dbg.target_distance_m);
+        self.motion_azimuth.store(dbg.azimuth_deg);
+        self.motion_facing.store(dbg.facing_deg);
+        self.motion_target_azimuth.store(dbg.target_azimuth_deg);
+        self.motion_target_facing.store(dbg.target_facing_deg);
         self.motion_progress.store(dbg.transition_progress);
         self.motion_age.store(dbg.seconds_since_transition);
         self.motion_manual.store(dbg.manual, Ordering::Relaxed);
@@ -193,6 +262,10 @@ impl SharedTelemetry {
             motion_state: motion_state_name(self.motion_state.load(Ordering::Relaxed)),
             motion_distance_m: self.motion_distance.load(),
             motion_target_m: self.motion_target.load(),
+            motion_azimuth_deg: self.motion_azimuth.load(),
+            motion_facing_deg: self.motion_facing.load(),
+            motion_target_azimuth_deg: self.motion_target_azimuth.load(),
+            motion_target_facing_deg: self.motion_target_facing.load(),
             motion_progress: self.motion_progress.load(),
             motion_age_s: self.motion_age.load(),
             motion_manual: self.motion_manual.load(Ordering::Relaxed),
@@ -204,6 +277,54 @@ impl SharedTelemetry {
             out_rate: self.out_rate.load(),
             in_channels: self.in_channels.load(Ordering::Relaxed),
             out_channels: self.out_channels.load(Ordering::Relaxed),
+            monitor_state: MonitorState::from_u8(self.mon_state.load(Ordering::Relaxed))
+                .name(),
+            monitor_fill: self.mon_fill.load(),
+            monitor_underflows: self.mon_underflows.load(Ordering::Relaxed),
+            monitor_rms_db: self.mon_rms_db.load(),
+            monitor_peak_db: self.mon_peak_db.load(),
+            monitor_gain_db: self.mon_gain_db.load(),
+            monitor_muted: self.mon_muted.load(Ordering::Relaxed),
+            monitor_rate: self.mon_rate.load(),
+            monitor_channels: self.mon_channels.load(Ordering::Relaxed),
+            monitor_device: self
+                .mon_meta
+                .lock()
+                .map(|m| m.device.clone())
+                .unwrap_or_default(),
+            monitor_error: self.mon_meta.lock().ok().and_then(|m| m.error.clone()),
+        }
+    }
+
+    pub fn set_monitor_state(&self, s: MonitorState) {
+        self.mon_state.store(s as u8, Ordering::Relaxed);
+    }
+    pub fn monitor_state(&self) -> MonitorState {
+        MonitorState::from_u8(self.mon_state.load(Ordering::Relaxed))
+    }
+    /// Per-tick monitor branch stats (processing thread only).
+    pub fn publish_monitor(&self, fill: f32, rms_db: f32, peak_db: f32, rate: f32, ch: u8) {
+        self.mon_fill.store(fill);
+        self.mon_rms_db.store(rms_db);
+        self.mon_peak_db.store(peak_db);
+        self.mon_rate.store(rate);
+        self.mon_channels.store(ch, Ordering::Relaxed);
+    }
+    pub fn set_monitor_gain(&self, db: f32, muted: bool) {
+        self.mon_gain_db.store(db);
+        self.mon_muted.store(muted, Ordering::Relaxed);
+    }
+    /// Record a monitor open/device error for the UI (non-RT path only).
+    pub fn set_monitor_error(&self, device: String, error: Option<String>) {
+        if let Ok(mut m) = self.mon_meta.lock() {
+            m.device = device;
+            m.error = error;
+        }
+    }
+    pub fn set_monitor_device(&self, device: String) {
+        if let Ok(mut m) = self.mon_meta.lock() {
+            m.device = device;
+            m.error = None;
         }
     }
 
@@ -268,6 +389,10 @@ pub struct TelemetrySnapshot {
     pub motion_state: &'static str,
     pub motion_distance_m: f32,
     pub motion_target_m: f32,
+    pub motion_azimuth_deg: f32,
+    pub motion_facing_deg: f32,
+    pub motion_target_azimuth_deg: f32,
+    pub motion_target_facing_deg: f32,
     pub motion_progress: f32,
     pub motion_age_s: f32,
     pub motion_manual: bool,
@@ -276,4 +401,16 @@ pub struct TelemetrySnapshot {
     pub out_rate: f32,
     pub in_channels: u8,
     pub out_channels: u8,
+    // monitor (second output) branch
+    pub monitor_state: &'static str,
+    pub monitor_fill: f32,
+    pub monitor_underflows: u64,
+    pub monitor_rms_db: f32,
+    pub monitor_peak_db: f32,
+    pub monitor_gain_db: f32,
+    pub monitor_muted: bool,
+    pub monitor_rate: f32,
+    pub monitor_channels: u8,
+    pub monitor_device: String,
+    pub monitor_error: Option<String>,
 }

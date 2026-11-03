@@ -31,10 +31,12 @@ export function RoutingTab() {
   const outputDevice = useStore((s) => s.outputDevice);
   const setInput = useStore((s) => s.setInput);
   const setOutput = useStore((s) => s.setOutput);
+  const s = useStore();
   const blockMs = useStore((s) => s.blockMs);
   const prebufferMs = useStore((s) => s.prebufferMs);
   const persistConfig = useStore((s) => s.persistConfig);
   const running = useStore((s) => s.running);
+  const telemetry = useStore((s) => s.telemetry);
   const [feedbackNote, setFeedbackNote] = React.useState<string | null>(null);
 
   React.useEffect(() => {
@@ -59,12 +61,12 @@ export function RoutingTab() {
           )}
           {devices.inputs.map((d) => (
             <DeviceRow
-              key={d.name}
+              key={d.id}
               name={d.name}
-              sub={`${d.default_channels}ch @ ${(d.default_rate / 1000).toFixed(1)}k${d.is_default ? " · default" : ""}`}
-              selected={inputDevice === d.name}
+              sub={`${d.default_channels}ch @ ${(d.default_rate / 1000).toFixed(1)}k${d.is_default ? " · default" : ""}${d.id !== d.name ? ` · ${d.id}` : ""}`}
+              selected={inputDevice === d.id}
               onSelect={() => {
-                setInput(inputDevice === d.name ? null : d.name);
+                setInput(inputDevice === d.id ? null : d.id);
                 persistConfig();
               }}
             />
@@ -77,12 +79,12 @@ export function RoutingTab() {
         <div className="space-y-1.5 max-h-80 overflow-y-auto pr-1">
           {devices.outputs.map((d) => (
             <DeviceRow
-              key={d.name}
+              key={d.id}
               name={d.name}
-              sub={`${d.default_channels}ch @ ${(d.default_rate / 1000).toFixed(1)}k${d.is_default ? " · default" : ""}`}
-              selected={outputDevice === d.name}
+              sub={`${d.default_channels}ch @ ${(d.default_rate / 1000).toFixed(1)}k${d.is_default ? " · default" : ""}${d.id !== d.name ? ` · ${d.id}` : ""}`}
+              selected={outputDevice === d.id}
               onSelect={() => {
-                setOutput(outputDevice === d.name ? null : d.name);
+                setOutput(outputDevice === d.id ? null : d.id);
                 persistConfig();
               }}
             />
@@ -95,7 +97,83 @@ export function RoutingTab() {
         )}
       </div>
 
-      <div className="panel p-4 xl:col-span-2">
+      {/* direct monitor */}
+      <div className="panel p-4">
+        <div className="flex items-center justify-between mb-3">
+          <div className="panel-title">Direct Monitor</div>
+          <div className="flex items-center gap-2">
+            {telemetry && (
+              <span className={`text-[9px] font-mono ${telemetry.monitor_state === "active" ? "text-[var(--color-cyan)]" : telemetry.monitor_state === "error" ? "text-[var(--color-warn)]" : "text-faint"}`}>
+                {telemetry.monitor_state === "active"
+                  ? `● ${(telemetry.monitor_rate / 1000).toFixed(1)}kHz u:${telemetry.monitor_underflows}`
+                  : telemetry.monitor_state === "opening"
+                    ? "… opening"
+                    : telemetry.monitor_state === "error"
+                      ? `⚠ ${telemetry.monitor_error ?? "error"}`
+                      : "off"}
+              </span>
+            )}
+            <label className="flex items-center gap-1.5 text-[10px] text-dim">
+              <input
+                type="checkbox"
+                checked={s.monitorEnabled}
+                onChange={(e) => s.setMonitor({ enabled: e.target.checked })}
+                disabled={!s.monitorDevice && !s.monitorEnabled}
+              />
+              Enable
+            </label>
+          </div>
+        </div>
+        <div className="text-[9px] text-faint mb-2">
+          Same processed signal, second independent output. Defaults to -18 dB
+          and ramps in. Primary output is never affected by monitor failures.
+        </div>
+        <div className="flex flex-col gap-0.5 max-h-36 overflow-y-auto">
+          {devices.outputs.map((d) => (
+            <DeviceRow
+              key={d.id}
+              name={d.name}
+              sub={`${d.default_channels}ch @ ${(d.default_rate / 1000).toFixed(1)}k${d.is_default ? " · default" : ""}${d.id !== d.name ? ` · ${d.id}` : ""}`}
+              selected={s.monitorDevice === d.id}
+              onSelect={() =>
+                s.setMonitor({ device: s.monitorDevice === d.id ? null : d.id })
+              }
+            />
+          ))}
+        </div>
+        <div className="flex items-center gap-4 mt-3">
+          <label className="flex items-center gap-1.5 text-[10px] text-dim">
+            <input
+              type="checkbox"
+              checked={s.monitorMuted}
+              onChange={(e) => s.setMonitor({ muted: e.target.checked })}
+              disabled={!s.monitorEnabled}
+            />
+            Mute
+          </label>
+          <label className="flex-1 flex items-center gap-2 text-[10px] text-dim">
+            Gain
+            <input
+              type="range"
+              min={-48}
+              max={12}
+              step={0.5}
+              value={s.monitorGainDb}
+              onChange={(e) => s.setMonitor({ gainDb: Number(e.target.value) })}
+              disabled={!s.monitorEnabled}
+              className="flex-1"
+            />
+            <span className="font-mono w-14 text-right">{s.monitorGainDb.toFixed(1)} dB</span>
+          </label>
+        </div>
+        {s.monitorWarning && (
+          <div className="mt-2 px-3 py-2 rounded-md border border-[var(--color-amber)] text-[10px] text-[var(--color-amber)]">
+            ⚠ {s.monitorWarning}
+          </div>
+        )}
+      </div>
+
+      <div className="panel p-4">
         <div className="panel-title mb-3">Stream tuning</div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-[11px]">
           <label className="flex flex-col gap-1">

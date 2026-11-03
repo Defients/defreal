@@ -6,5 +6,10 @@ pub mod offline;
 pub mod resample;
 pub mod telemetry;
 
-pub use engine::{AudioEngine, EngineCommand, EngineConfig, EngineError, INTERNAL_RATE};
-pub use telemetry::{EngineState, TelemetrySnapshot};
+pub use engine::{
+    AudioEngine, EngineCommand, EngineConfig, EngineError, MonitorBranch, MonitorConfig, Pump,
+    INTERNAL_RATE,
+};
+#[doc(hidden)]
+pub use engine::dispatch;
+pub use telemetry::{EngineState, SharedTelemetry, TelemetrySnapshot};
