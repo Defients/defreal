@@ -1,0 +1,24 @@
+[package]
+name = "defreal-app"
+description = "DefReal desktop application (Tauri)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+default-run = "defreal-app"
+
+[lib]
+name = "defreal_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+defreal-dsp = { workspace = true }
+defreal-audio = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"

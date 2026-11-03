@@ -1,0 +1,73 @@
+# DefReal Quickstart
+
+## 1. Run it
+
+Dev build from source:
+
+```bash
+cd frontend && npm install && cd ..
+cargo run -p defreal-app
+```
+
+Release build + installer:
+
+```bash
+cd frontend && npm install && cd ..
+frontend/node_modules/.bin/tauri build
+# artifacts under src-tauri/target/release/bundle/
+```
+
+## 2. First listen (microphone → headphones)
+
+1. Open **ROUTING**.
+2. Capture: your mic (e.g. `Microphone (HyperX Quadcast)`).
+3. Send to: your headphones.
+   ⚠️ If your output is *speakers* while your input is a live mic, you may get
+   acoustic feedback — DefReal warns you when the routing looks risky. Prefer
+   headphones for the first run.
+4. **START** → speak. Set REALISM ≈ 40.
+5. Click **BYPASS** on/off to A/B.
+
+## 3. RVC → DefReal → OBS / Discord (virtual cable routing)
+
+You need a virtual audio cable (VB-Audio Virtual Cable or VoiceMeeter — both
+already common in RVC setups).
+
+1. In **RVC**, set the output device to `CABLE-A Input (VB-Audio)`.
+2. In **DefReal → ROUTING**:
+   - Capture from: `CABLE-A Output (VB-Audio)`
+   - Send to: `CABLE-B Input (VB-Audio)`  (a *second* cable — do NOT loop back to the same cable)
+3. In **OBS/Discord**, select `CABLE-B Output (VB-Audio)` as your mic.
+
+Result: RVC voice → DefReal realism → apps hear the processed signal.
+
+Monitoring yourself: additionally select your real headphones as the output, or
+use OBS's audio monitoring. Keep the DefReal→OBS cable separate from the
+RVC→DefReal cable.
+
+## 4. Natural Motion
+
+- On the **PERFORM** tab, the top-down view shows the mic (violet diamond) and
+  your virtual speaker position (cyan dot). Distance rings are 0.25 / 0.5 / 1 / 2 m.
+- The graph below shows distance over the last 30 s.
+- In **Proximity**, switch Position mode to **Manual** to drag the distance /
+  azimuth yourself — or click *Release → Auto* to hand control back.
+- Motion trigger buttons (lean-in, lean-back, turn-aside, reposition) queue a
+  move; with *Speech-aware* on, the move waits for a pause in your voice.
+
+## 5. Presets
+
+- Factory presets (e.g. **Natural Presence**, **Lived-In Room**) can't be
+  overwritten — tweak them, then **Save preset** as your own.
+- User presets live in `%APPDATA%/DefReal/presets/` as JSON; import /
+  export from the **PRESETS** tab.
+- Last-used preset + device routing restore on launch.
+
+## 6. LAB (offline render + A/B)
+
+- **Offline render**: input WAV → processed WAV through any preset.
+  Deterministic — same seed, same output.
+- **A/B comparison**: writes `a_original.wav`, `b_processed.wav`, and
+  `b_processed_matched.wav` (loudness-matched) to a folder. Import all three
+  into a player/DAW and flip between them — the matched file removes the
+  "louder sounds better" bias.

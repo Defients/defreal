@@ -1,0 +1,18 @@
+[package]
+name = "defreal-audio"
+description = "DefReal audio engine - device capture/playback, clock sync, offline render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+defreal-dsp = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+cpal = "0.15"
+rubato = "0.16"
+ringbuf = "0.4"
+hound = "3.5"
+arc-swap = "1.7"
+atomic_float = "1.1"

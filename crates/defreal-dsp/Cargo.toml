@@ -1,0 +1,14 @@
+[package]
+name = "defreal-dsp"
+description = "DefReal pure DSP core - platform independent audio processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hound = "3.5"
