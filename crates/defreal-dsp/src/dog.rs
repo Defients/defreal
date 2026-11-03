@@ -926,9 +926,10 @@ impl DogEngine {
 
         // spatial derivation at block rate — ROOMLOGIC: dog position maps to
         // the shared scene (mic at origin); cross-room dog = occluded dog.
+        let door_now = self.door.next_block(n);
         let az_r = self.beh.pos.1.to_radians();
         let (sx, sy) = (self.beh.pos.0 * az_r.cos(), self.beh.pos.0 * az_r.sin());
-        let pr = crate::scene::propagate(sx, sy, self.door.get());
+        let pr = crate::scene::propagate(sx, sy, door_now);
         let pos = PositionState {
             distance_m: pr.eff_distance_m.max(self.beh.pos.0),
             azimuth_deg: self.beh.pos.1,
@@ -956,7 +957,15 @@ impl DogEngine {
             // mix active voices (bounded)
             for v in self.voices.iter_mut() {
                 if v.pos < v.len {
-                    let b = &self.bank.bufs[v.buf_idx >> 8][v.buf_idx & 0xff];
+                    let Some(b) = self
+                        .bank
+                        .bufs
+                        .get(v.buf_idx >> 8)
+                        .and_then(|vv| vv.get(v.buf_idx & 0xff))
+                    else {
+                        v.pos = v.len;
+                        continue;
+                    };
                     let s = b[v.pos];
                     let mut g = v.gain;
                     if v.pos < v.fade_in {
@@ -992,15 +1001,25 @@ impl DogEngine {
             // steal the oldest
             self.voices.remove(0);
         }
-        let kind = ev_idx(s.ev);
+        let kind = ev_idx(s.ev).min(N_EVENTS - 1);
         // variant selection avoiding immediate repeats
-        let last = self.bank.last_variant[kind];
+        let last = self.bank.last_variant.get(kind).copied().unwrap_or(usize::MAX);
         let mut var = self.rng.below(VARIANTS as u64) as usize;
         if var == last {
             var = (var + 1) % VARIANTS;
         }
-        self.bank.last_variant[kind] = var;
-        let len = self.bank.bufs[kind][var].len();
+        if let Some(lv) = self.bank.last_variant.get_mut(kind) {
+            *lv = var;
+        }
+        let Some(len) = self
+            .bank
+            .bufs
+            .get(kind)
+            .and_then(|v| v.get(var))
+            .map(|b| b.len())
+        else {
+            return;
+        };
         let fade_in = (0.01 * self.sr) as usize;
         let fade_out = (0.05 * self.sr) as usize;
         // slight per-play variation (bounded, natural)
