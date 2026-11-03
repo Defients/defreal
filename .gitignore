@@ -5,9 +5,7 @@ frontend/dist
 *.wav
 dev-assets/
 
-# website
-website/app/node_modules
-website/app/dist
-website/app/.qa
-website/app/scripts/_art
+# website (kept local, not part of the public repo)
+website/
+website.zip
 DefReal-v1.zip
