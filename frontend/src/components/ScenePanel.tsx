@@ -76,7 +76,7 @@ export function ScenePanel() {
               {emitters.map((e) => {
                 const live = tel?.emitters.find((t) => t.id === e.id);
                 return (
-                  <div key={e.id} className="flex items-center gap-2 text-[10px]">
+                  <div key={e.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px]">
                     <span className={e.muted ? "text-faint line-through w-16" : "text-dim w-16"}>
                       {e.cat}
                     </span>

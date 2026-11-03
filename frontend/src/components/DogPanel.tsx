@@ -64,7 +64,7 @@ export function DogPanel() {
         (see docs); barking is off until you allow it.
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 gap-3">
         <Seg<DogSize>
           label="Size"
           value={dog.size}
@@ -95,8 +95,8 @@ export function DogPanel() {
         />
       </div>
 
-      <div className="flex items-center gap-4 mt-3">
-        <label className="flex-1 flex items-center gap-2 text-[10px] text-dim">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-3">
+        <label className="flex-1 min-w-36 flex items-center gap-2 text-[10px] text-dim">
           Volume
           <input
             type="range"
