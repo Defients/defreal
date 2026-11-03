@@ -5,7 +5,10 @@ import type {
   ChainParams,
   DeviceInfo,
   DogConfig,
+  EmitterCat,
+  EmitterCfg,
   MotionMode,
+  SceneConfig,
   PresetMeta,
   SnapshotMeta,
   Telemetry,
@@ -57,6 +60,10 @@ interface DefRealStore {
   dogDragging: boolean;
   dogPos: { d: number; az: number } | null; // live dog drag position (UI-side)
 
+  // roomlogic + soundstage (v0.3.0)
+  scene: SceneConfig;
+  emitters: EmitterCfg[];
+
   // motion history (last ~30s, ~15hz)
   distanceHistory: DistanceSample[];
 
@@ -98,6 +105,11 @@ interface DefRealStore {
   dogDragStart: () => void;
   dogDragMove: (d: number, az: number) => void;
   dogDragEnd: () => Promise<void>;
+  setScene: (patch: Partial<SceneConfig>) => Promise<void>;
+  addEmitter: (cat: EmitterCat, x?: number, y?: number) => Promise<void>;
+  updateEmitter: (id: number, patch: Partial<EmitterCfg>) => Promise<void>;
+  removeEmitter: (id: number) => Promise<void>;
+  syncScene: () => Promise<void>;
   acousticAction: (name: string) => Promise<void>;
   recallSnapshot: (name: string) => Promise<void>;
   saveSnapshot: (name: string, transitionS: number, modeAfter: string) => Promise<void>;
@@ -146,6 +158,8 @@ export const useStore = create<DefRealStore>((set, get) => ({
   },
   dogDragging: false,
   dogPos: null,
+  scene: { enabled: true, door_open: 1.0, room_b: "SmallLivingRoom" },
+  emitters: [],
   distanceHistory: [],
   activeTab: "perform",
   toast: null,
@@ -200,6 +214,8 @@ export const useStore = create<DefRealStore>((set, get) => ({
           activity: "Rare", volume_db: -24, allow_bark: false,
           route: "Both", manual_pos: null,
         },
+        scene: cfg.scene ?? { enabled: true, door_open: 1.0, room_b: "SmallLivingRoom" },
+        emitters: cfg.emitters ?? [],
       });
       if (cfg.last_preset) {
         await loadPreset(cfg.last_preset);
@@ -226,6 +242,7 @@ export const useStore = create<DefRealStore>((set, get) => ({
     try {
       await api.engineStart(inputDevice, outputDevice, blockMs, prebufferMs, ackFeedback);
       set({ running: true });
+      await get().syncScene();
       await get().persistConfig();
     } catch (e) {
       const msg = String(e);
@@ -444,6 +461,56 @@ export const useStore = create<DefRealStore>((set, get) => ({
     await get().persistConfig();
   },
 
+  // --- roomlogic / soundstage (v0.3.0) ---
+  setScene: async (patch) => {
+    const scene = { ...get().scene, ...patch };
+    set({ scene });
+    await api.sceneSet(scene).catch(() => {});
+    await get().persistConfig();
+  },
+
+  addEmitter: async (cat, x = 0.9, y = 0.4) => {
+    if (get().emitters.length >= 8) return;
+    const cfg: EmitterCfg = {
+      id: Math.max(0, ...get().emitters.map((e) => e.id)) + 1,
+      cat, x, y,
+      gain_db: -30, activity: "Natural", enabled: true, muted: false,
+    };
+    const emitters = [...get().emitters, cfg];
+    set({ emitters });
+    await api.emitterAdd(cfg).catch(() => {});
+    await get().persistConfig();
+  },
+
+  updateEmitter: async (id, patch) => {
+    const emitters = get().emitters.map((e) =>
+      e.id === id ? { ...e, ...patch } : e
+    );
+    set({ emitters });
+    const cfg = emitters.find((e) => e.id === id);
+    if (cfg) {
+      await api.emitterUpdate(id, cfg).catch(() => {});
+      await get().persistConfig();
+    }
+  },
+
+  removeEmitter: async (id) => {
+    set({ emitters: get().emitters.filter((e) => e.id !== id) });
+    await api.emitterRemove(id).catch(() => {});
+    await get().persistConfig();
+  },
+
+  /// replay scene + emitters into the engine (after start/restart)
+  syncScene: async () => {
+    const s = get();
+    await api.sceneSet(s.scene).catch(() => {});
+    for (const e of s.emitters) {
+      await api.emitterAdd(e).catch(() => {});
+    }
+    // dog occlusion follows the same door
+    await api.dogSet(s.dog).catch(() => {});
+  },
+
   acousticAction: async (name) => {
     const s = get();
     // deterministic poses on the shared spatial state
@@ -513,6 +580,7 @@ export const useStore = create<DefRealStore>((set, get) => ({
     try {
       await api.engineRestart(s.inputDevice, s.outputDevice, s.blockMs, s.prebufferMs);
       set({ running: true, engineError: null });
+      await get().syncScene();
       // re-apply monitor after restart (branch state lives in engine thread)
       if (s.monitorEnabled && s.monitorDevice) {
         await api.monitorSet(true, s.monitorDevice, s.monitorGainDb, s.monitorMuted);
@@ -539,6 +607,8 @@ export const useStore = create<DefRealStore>((set, get) => ({
       motion_mode: s.motionMode,
       touch_return_s: s.touchReturnS,
       dog: s.dog,
+      scene: s.scene,
+      emitters: s.emitters,
     };
     await api.configSave(cfg).catch(() => {});
   },

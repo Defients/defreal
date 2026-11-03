@@ -78,6 +78,13 @@ export const api = {
   dogSet: (cfg: import("./types").DogConfig) => invoke<void>("dog_set", { cfg }),
   dogCommand: (name: string) => invoke<void>("dog_command", { name }),
   dogPreview: () => invoke<void>("dog_preview"),
+  sceneSet: (cfg: import("./types").SceneConfig) =>
+    invoke<void>("scene_set", { cfg }),
+  emitterAdd: (cfg: import("./types").EmitterCfg) =>
+    invoke<void>("emitter_add", { cfg }),
+  emitterRemove: (id: number) => invoke<void>("emitter_remove", { id }),
+  emitterUpdate: (id: number, cfg: import("./types").EmitterCfg) =>
+    invoke<void>("emitter_update", { id, cfg }),
   engineReset: () => invoke<void>("engine_reset"),
   presetsList: () => invoke<PresetMeta[]>("presets_list"),
   presetLoad: (name: string) => invoke<ChainParams>("preset_load", { name }),

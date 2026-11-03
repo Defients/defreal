@@ -107,3 +107,29 @@ scripts/              — icon generator
 ```
 
 More detail: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+## v0.3.0 — THE LIVING ENVIRONMENT PROTOCOL (ROOMLOGIC × SOUNDSTAGE)
+
+DefReal now simulates **what the virtual microphone hears**, not just how it
+sounds: one shared acoustic scene (metric, mic at origin) containing the
+voice speaker, DefDog, and SOUNDSTAGE environmental emitters.
+
+**ROOMLOGIC** — a two-room model: STUDIO (your voice's room) + HALLWAY,
+separated by a wall at x = 1.5 m with a doorway. Cross-room sources are
+heard through the door: open → clear (-1.5 dB, 8.2 kHz LP, door-path
+detour); closed → muffled (-13 dB, 1.3 kHz LP) with residual low-frequency
+transmission — never silence. Perceptually motivated approximation, not
+measured acoustics. DefDog participates fully: drag it past the wall and
+close the door to hear it muffle.
+
+**SOUNDSTAGE** — up to 8 positioned emitters: computer fan, ventilation,
+distant traffic (continuous textures); keyboard typing bursts, chair
+creaks, desk taps, footsteps (scheduled micro-events with bursts, cooldowns,
+non-repeating variations, Quiet/Natural/Busy activity). All procedurally
+synthesized (documented provenance, deterministic seeds) — no sample
+files, no licensing issues. Positions, door state, emitters persist in
+config.json; emitters replay into the engine on start/restart.
+
+UI: the Live Presence Stage draws wall + door (click to toggle) + emitter
+markers (draggable); the SoundStage panel adds/removes/mutes sources.
+Door transitions are smoothed (500 ms) — no clicks.

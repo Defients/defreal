@@ -25,10 +25,19 @@ function toXY(d: number, az: number, cx: number, cy: number, scale: number) {
   return [cx + Math.sin(a) * d * scale, cy - Math.cos(a) * d * scale] as const;
 }
 
+// ROOMLOGIC scene coords (meters, mic at origin, hallway at x>1.5)
+const WALL_X = 1.5;
+function sceneToXY(x: number, y: number, cx: number, cy: number, scale: number) {
+  return [cx + y * scale, cy - x * scale] as const;
+}
+function xyToScene(px: number, py: number, cx: number, cy: number, scale: number) {
+  return { x: (cy - py) / scale, y: (px - cx) / scale };
+}
+
 /** Interactive Live Presence Stage: draggable speaker vs. fixed mic. */
 export function Stage() {
   const ref = useRef<HTMLCanvasElement>(null);
-  const dragRef = useRef<{ active: boolean; lastSend: number; dog: boolean }>({ active: false, lastSend: 0, dog: false });
+  const dragRef = useRef<{ active: boolean; lastSend: number; dog: boolean; emit: number | null }>({ active: false, lastSend: 0, dog: false, emit: null });
   const posRef = useRef({ d: 0.32, az: 0, f: 0 });
   const t = useStore((s) => s.telemetry);
   const motionMode = useStore((s) => s.motionMode);
@@ -57,6 +66,9 @@ export function Stage() {
     const now = performance.now();
     if (now - dragRef.current.lastSend < THROTTLE_MS) return;
     dragRef.current.lastSend = now;
+    if (dragRef.current.emit != null) {
+      return; // emitter drags use scene coords, handled in onPointerMove
+    }
     if (dragRef.current.dog) {
       useStore.getState().dogDragMove(d, az);
     } else {
@@ -78,8 +90,23 @@ export function Stage() {
     const r = ref.current!.getBoundingClientRect();
     const px = ((e.clientX - r.left) / r.width) * W;
     const py = ((e.clientY - r.top) / r.height) * H;
-    // drag arbitration: near the dog marker -> move the dog, else speaker
+    // arbitration: door toggle > emitter drag > dog drag > speaker drag
     const tel = st.telemetry;
+    const wallY = cy - WALL_X * scale;
+    const doorL = cx - 0.45 * scale;
+    const doorR = cx + 0.45 * scale;
+    if (Math.abs(py - wallY) < 9 && px > doorL - 6 && px < doorR + 6 && st.scene.enabled) {
+      st.setScene({ door_open: st.scene.door_open > 0.5 ? 0 : 1 });
+      return;
+    }
+    for (const em of tel?.emitters ?? []) {
+      const [ex, ey] = sceneToXY(em.x, em.y, cx, cy, scale);
+      if (Math.hypot(px - ex, py - ey) < 16) {
+        dragRef.current.emit = em.id;
+        dragRef.current.active = true;
+        return;
+      }
+    }
     let dogHit = false;
     if (st.dog.enabled && tel?.dog_enabled) {
       const [dx2, dy2] = toXY(tel.dog_distance_m, tel.dog_azimuth_deg, cx, cy, scale);
@@ -99,6 +126,17 @@ export function Stage() {
   };
   const onPointerMove = (e: React.PointerEvent) => {
     if (!dragRef.current.active) return;
+    if (dragRef.current.emit != null) {
+      const now = performance.now();
+      if (now - dragRef.current.lastSend < THROTTLE_MS) return;
+      dragRef.current.lastSend = now;
+      const r = ref.current!.getBoundingClientRect();
+      const px = ((e.clientX - r.left) / r.width) * W;
+      const py = ((e.clientY - r.top) / r.height) * H;
+      const sp = xyToScene(px, py, cx, cy, scale);
+      useStore.getState().updateEmitter(dragRef.current.emit, { x: sp.x, y: sp.y });
+      return;
+    }
     const p = pointerPos(e);
     posRef.current.d = p.d;
     posRef.current.az = p.az;
@@ -107,8 +145,11 @@ export function Stage() {
   const onPointerUp = () => {
     if (!dragRef.current.active) return;
     const wasDog = dragRef.current.dog;
+    const wasEmit = dragRef.current.emit;
     dragRef.current.active = false;
     dragRef.current.dog = false;
+    dragRef.current.emit = null;
+    if (wasEmit != null) return;
     if (wasDog) {
       useStore.getState().dogDragEnd();
     } else {
@@ -268,6 +309,50 @@ export function Stage() {
       ctx.fill();
       ctx.restore();
 
+      // ROOMLOGIC: wall at x=1.5m -> horizontal line; door = gap segment.
+      // (scene x = forward/up on stage, y = lateral)
+      if (st.scene.enabled) {
+        const wallY = cy - WALL_X * scale;
+        const doorL = cx - 0.45 * scale;
+        const doorR = cx + 0.45 * scale;
+        const doorOpen = tel?.door_open ?? st.scene.door_open;
+        ctx.strokeStyle = "#2c2c48";
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(0, wallY); ctx.lineTo(doorL, wallY); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(doorR, wallY); ctx.lineTo(W, wallY); ctx.stroke();
+        ctx.lineWidth = 1;
+        // door leaf: slides/swings by openness
+        ctx.strokeStyle = doorOpen > 0.5 ? "#3ee6d8" : "#e86a6a";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        const leaf = doorR - doorL;
+        ctx.moveTo(doorL, wallY);
+        ctx.lineTo(doorL + leaf * (1 - doorOpen) * 0.92, wallY - leaf * doorOpen * 0.55);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+        ctx.fillStyle = "#8a8aa5";
+        ctx.font = "9px monospace";
+        ctx.fillText("HALLWAY", 6, wallY - 6);
+        ctx.fillText("STUDIO", 6, wallY + 14);
+        ctx.fillText(doorOpen > 0.5 ? "door open" : "door closed", doorR + 6, wallY - 4);
+
+        // emitters (from engine telemetry — the applied scene state)
+        for (const em of tel?.emitters ?? []) {
+          const [ex, ey] = sceneToXY(em.x, em.y, cx, cy, scale);
+          if (ey < -12) continue;
+          const col = em.active ? "#e8b04a" : "#8a6a2a";
+          ctx.fillStyle = col;
+          ctx.beginPath();
+          ctx.roundRect(ex - 6, ey - 6, 12, 12, 3);
+          ctx.fill();
+          ctx.strokeStyle = "#0a0a12";
+          ctx.stroke();
+          ctx.fillStyle = "rgba(232,176,74,0.9)";
+          ctx.font = "9px monospace";
+          ctx.fillText(em.cat, ex + 8, ey + 3);
+        }
+      }
+
       // labels
       ctx.fillStyle = "#8a8aa5";
       ctx.font = "11px monospace";
@@ -360,7 +445,7 @@ export function Stage() {
         }}
       />
       <div className="flex justify-between text-[9px] text-faint mt-1">
-        <span>drag speaker (cyan) or dog (amber) · arrows nudge · Home resets</span>
+        <span>drag speaker/dog/emitters · click door to toggle · arrows nudge</span>
         <span>
           {t ? `${(t.motion_distance_m ?? 0).toFixed(2)} m · ${(t.motion_azimuth_deg ?? 0).toFixed(0)}°` : "—"}
         </span>

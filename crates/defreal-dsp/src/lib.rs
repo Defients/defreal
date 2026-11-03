@@ -22,6 +22,8 @@ pub mod realism;
 pub mod reverb;
 pub mod rng;
 pub mod roomspace;
+pub mod scene;
+pub mod soundstage;
 pub mod saturate;
 pub mod smooth;
 pub mod vad;
@@ -33,3 +35,7 @@ pub use dog::{
 };
 pub use motion::{MotionState, PositionState};
 pub use preset::Preset;
+pub use scene::{propagate, room_of, Prop, PropKind, RoomId, SceneConfig};
+pub use soundstage::{
+    EmitterActivity, EmitterCat, EmitterCfg, EmitterInfo, SoundStage, MAX_EMITTERS,
+};

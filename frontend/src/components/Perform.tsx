@@ -3,6 +3,7 @@ import { Knob, Meter } from "./widgets";
 import { Stage, MotionHistory } from "./Stage";
 import { ModulePanels } from "./Modules";
 import { DogPanel } from "./DogPanel";
+import { ScenePanel } from "./ScenePanel";
 
 export function PerformTab() {
   const params = useStore((s) => s.params);
@@ -111,6 +112,7 @@ export function PerformTab() {
             </div>
           </div>
           <DogPanel />
+          <ScenePanel />
         </div>
         <ModulePanels />
       </div>

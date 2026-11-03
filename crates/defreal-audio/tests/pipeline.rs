@@ -528,3 +528,76 @@ fn dog_set_command_surfaces_in_telemetry() {
     assert!(s.dog_enabled, "dog enabled not in telemetry");
     assert_eq!(s.dog_state, "resting");
 }
+
+// --- roomlogic/soundstage (v0.3.0) --------------------------------------------
+
+#[test]
+fn closed_door_muffles_hallway_emitter_through_pump() {
+    use defreal_audio::engine::dispatch;
+    let run = |door: f32| {
+        let mut r = rig(48000, 48000);
+        dispatch(
+            defreal_audio::EngineCommand::SceneSet(defreal_dsp::SceneConfig {
+                enabled: true,
+                door_open: door,
+                ..Default::default()
+            }),
+            &mut r.pump,
+            &r.telemetry,
+        );
+        dispatch(
+            defreal_audio::EngineCommand::EmitterAdd(defreal_dsp::EmitterCfg {
+                id: 1,
+                cat: defreal_dsp::EmitterCat::Fan,
+                x: 2.2,
+                y: 0.2,
+                gain_db: -12.0,
+                ..Default::default()
+            }),
+            &mut r.pump,
+            &r.telemetry,
+        );
+        // 3s: silence input, fan carries the signal; door smooths in ~500ms
+        push_all(&mut r, &vec![0.0f32; 48000 * 3]);
+        for _ in 0..600 {
+            r.pump.tick();
+        }
+        let mut out = Vec::new();
+        while let Some(s) = r.out_cons.try_pop() {
+            out.push(s);
+        }
+        rms(&out)
+    };
+    let open = run(1.0);
+    let closed = run(0.0);
+    assert!(open > 1e-4, "hallway fan inaudible even with open door: {open}");
+    // low-frequency fan rumble legitimately transmits through a closed door;
+    // the drop is real but not total (see dsp test for broad-band muffling)
+    assert!(closed < open * 0.85, "door made no difference: open {open} closed {closed}");
+    assert!(closed > 1e-5, "closed door should muffle, not silence: {closed}");
+}
+
+#[test]
+fn disabled_soundstage_is_silent() {
+    use defreal_audio::engine::dispatch;
+    let mut r = rig(48000, 48000);
+    dispatch(
+        defreal_audio::EngineCommand::EmitterAdd(defreal_dsp::EmitterCfg {
+            id: 1,
+            cat: defreal_dsp::EmitterCat::Fan,
+            gain_db: -12.0,
+            ..Default::default()
+        }),
+        &mut r.pump,
+        &r.telemetry,
+    );
+    push_all(&mut r, &vec![0.0f32; 24000]);
+    for _ in 0..300 {
+        r.pump.tick();
+    }
+    let mut out = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() {
+        out.push(s);
+    }
+    assert!(rms(&out) < 0.02, "disabled stage audible: {}", rms(&out));
+}

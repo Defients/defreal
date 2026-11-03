@@ -661,6 +661,7 @@ pub struct DogEngine {
     // spatial path
     lp: Biquad,
     lp_hz: f32,
+    door: SmoothedParam,
     direct_gain: SmoothedParam,
     send_gain: f32,
     derived: ProximityDerived,
@@ -689,6 +690,7 @@ impl DogEngine {
             time: 0.0,
             lp: Biquad::new(BiquadKind::LowPass { freq: 17000.0, q: 0.6 }, sr),
             lp_hz: 17000.0,
+            door: SmoothedParam::new(1.0, 500.0, sr),
             direct_gain: SmoothedParam::new(1.0, 30.0, sr),
             send_gain: 0.5,
             derived: ProximityDerived { direct_gain: 1.0, lp_hz: 17000.0, proximity_bass_db: 0.0, room_send: 1.0 },
@@ -735,6 +737,11 @@ impl DogEngine {
     /// Cheap: only rebuilds filters when the room spec actually changed.
     pub fn sync_room(&mut self, p: &RoomspaceParams) {
         self.room.update(p);
+    }
+
+    /// ROOMLOGIC door state, 0 = closed .. 1 = open (smoothed).
+    pub fn set_door(&mut self, open: f32) {
+        self.door.set(open.clamp(0.0, 1.0));
     }
 
     /// Deliberate user preview: a couple of benign non-bark events at the
@@ -917,21 +924,26 @@ impl DogEngine {
             return;
         }
 
-        // spatial derivation at block rate
+        // spatial derivation at block rate — ROOMLOGIC: dog position maps to
+        // the shared scene (mic at origin); cross-room dog = occluded dog.
+        let az_r = self.beh.pos.1.to_radians();
+        let (sx, sy) = (self.beh.pos.0 * az_r.cos(), self.beh.pos.0 * az_r.sin());
+        let pr = crate::scene::propagate(sx, sy, self.door.get());
         let pos = PositionState {
-            distance_m: self.beh.pos.0,
+            distance_m: pr.eff_distance_m.max(self.beh.pos.0),
             azimuth_deg: self.beh.pos.1,
             facing_deg: 0.0,
         };
         let d = derive_from_position(&pos, 0.8);
         self.derived = d;
-        if (d.lp_hz - self.lp_hz).abs() > 20.0 {
-            self.lp.set(BiquadKind::LowPass { freq: d.lp_hz, q: 0.6 }, self.sr);
-            self.lp_hz = d.lp_hz;
+        let lp_target = d.lp_hz.min(pr.lp_hz);
+        if (lp_target - self.lp_hz).abs() > 20.0 {
+            self.lp.set(BiquadKind::LowPass { freq: lp_target, q: 0.6 }, self.sr);
+            self.lp_hz = lp_target;
         }
-        self.direct_gain.set(d.direct_gain);
+        self.direct_gain.set(d.direct_gain * pr.gain);
         // dog sits "in the room": slightly more room contribution than voice
-        self.send_gain = (0.45 * d.room_send).clamp(0.3, 1.2);
+        self.send_gain = (0.45 * d.room_send * pr.send_mul).clamp(0.3, 1.2);
 
         let az = self.beh.pos.1.to_radians();
         // subtle physical tilt only — mic pickup, not a panner (±2.5 dB max)

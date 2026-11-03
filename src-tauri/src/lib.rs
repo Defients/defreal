@@ -67,6 +67,9 @@ pub struct AppConfig {
     pub touch_return_s: f32,
     // defdog (v0.2.0): versioned companion section; defaults = disabled
     pub dog: defreal_dsp::DogConfig,
+    // roomlogic scene + soundstage emitters (v0.3.0)
+    pub scene: defreal_dsp::SceneConfig,
+    pub emitters: Vec<defreal_dsp::EmitterCfg>,
 }
 
 fn default_config() -> AppConfig {
@@ -553,6 +556,56 @@ fn dog_preview(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+// --- ROOMLOGIC / SOUNDSTAGE ---------------------------------------------------
+
+#[tauri::command]
+fn scene_set(state: State<'_, AppState>, cfg: defreal_dsp::SceneConfig) -> Result<(), String> {
+    let mut c = cfg;
+    c.door_open = c.door_open.clamp(0.0, 1.0);
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .try_send(EngineCommand::SceneSet(c));
+    Ok(())
+}
+
+#[tauri::command]
+fn emitter_add(state: State<'_, AppState>, cfg: defreal_dsp::EmitterCfg) -> Result<(), String> {
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .try_send(EngineCommand::EmitterAdd(cfg));
+    Ok(())
+}
+
+#[tauri::command]
+fn emitter_remove(state: State<'_, AppState>, id: u32) -> Result<(), String> {
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .try_send(EngineCommand::EmitterRemove(id));
+    Ok(())
+}
+
+#[tauri::command]
+fn emitter_update(
+    state: State<'_, AppState>,
+    id: u32,
+    cfg: defreal_dsp::EmitterCfg,
+) -> Result<(), String> {
+    let mut c = cfg;
+    c.gain_db = c.gain_db.clamp(-48.0, 0.0);
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .try_send(EngineCommand::EmitterUpdate(id, c));
+    Ok(())
+}
+
 // --- acoustic snapshots --------------------------------------------------------
 //
 // Snapshots are lightweight spatial memories (position + transition + mode),
@@ -823,6 +876,10 @@ pub fn run() {
             dog_set,
             dog_command,
             dog_preview,
+            scene_set,
+            emitter_add,
+            emitter_remove,
+            emitter_update,
             snapshots_list,
             snapshot_recall,
             snapshot_save,

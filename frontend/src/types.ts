@@ -65,6 +65,12 @@ export interface Telemetry {
   dog_rms_db: number;
   dog_peak_db: number;
   dog_last_event: string | null;
+  stage_enabled: boolean;
+  /** 0 = closed .. 1 = fully open */
+  door_open: number;
+  stage_rms_db: number;
+  stage_peak_db: number;
+  emitters: EmitterTelemetry[];
 }
 
 export interface DeviceInfo {
@@ -182,6 +188,8 @@ export interface AppConfig {
   motion_mode: string;
   touch_return_s: number;
   dog: DogConfig;
+  scene: SceneConfig;
+  emitters: EmitterCfg[];
 }
 
 export type DogSize = "Small" | "Medium" | "Large";
@@ -198,6 +206,43 @@ export interface DogConfig {
   allow_bark: boolean;
   route: DogRoute;
   manual_pos: [number, number] | null;
+}
+
+export interface EmitterTelemetry {
+  id: number;
+  cat: string;
+  x: number;
+  y: number;
+  room: string;
+  active: boolean;
+}
+
+export type EmitterCat =
+  | "Fan"
+  | "Vent"
+  | "Traffic"
+  | "Keys"
+  | "Chair"
+  | "Desk"
+  | "Footsteps";
+export type EmitterActivity = "Quiet" | "Natural" | "Busy";
+
+export interface EmitterCfg {
+  id: number;
+  cat: EmitterCat;
+  x: number;
+  y: number;
+  gain_db: number;
+  activity: EmitterActivity;
+  enabled: boolean;
+  muted: boolean;
+}
+
+export interface SceneConfig {
+  enabled: boolean;
+  /** 0 = closed .. 1 = fully open */
+  door_open: number;
+  room_b: string;
 }
 
 export interface RenderReport {

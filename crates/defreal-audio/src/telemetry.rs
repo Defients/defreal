@@ -99,6 +99,13 @@ pub struct SharedTelemetry {
     dog_rms_db: AtomicF32,
     dog_peak_db: AtomicF32,
     dog_last_event: AtomicU8,
+    // SOUNDSTAGE / ROOMLOGIC
+    stage_enabled: AtomicBool,
+    stage_door: AtomicF32,
+    stage_rms_db: AtomicF32,
+    stage_peak_db: AtomicF32,
+    /// latest emitter list — set on scene commands (non-RT path)
+    pub emitters_meta: std::sync::Mutex<Vec<EmitterTel>>,
 }
 
 /// Stringy monitor info that can't live in atomics.
@@ -203,6 +210,11 @@ impl SharedTelemetry {
             dog_rms_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
             dog_peak_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
             dog_last_event: AtomicU8::new(255),
+            stage_enabled: AtomicBool::new(false),
+            stage_door: AtomicF32(AtomicU64::new((1.0f32).to_bits() as u64)),
+            stage_rms_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
+            stage_peak_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
+            emitters_meta: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -265,6 +277,35 @@ impl SharedTelemetry {
         self.dog_peak_db.store(peak_db);
         self.dog_last_event
             .store(d.last_event.map(dog_event_u8).unwrap_or(255), Ordering::Relaxed);
+    }
+
+    /// Per-tick soundstage stats (processing thread only).
+    pub fn publish_stage(&self, door: f32, enabled: bool, rms_db: f32, peak_db: f32) {
+        self.stage_door.store(door);
+        self.stage_enabled.store(enabled, Ordering::Relaxed);
+        self.stage_rms_db.store(rms_db);
+        self.stage_peak_db.store(peak_db);
+    }
+
+    /// Emitter list — call on scene commands only (locks a mutex).
+    pub fn publish_emitters(&self, info: &[defreal_dsp::EmitterInfo]) {
+        let v: Vec<EmitterTel> = info
+            .iter()
+            .map(|e| EmitterTel {
+                id: e.id,
+                cat: emitter_cat_name(e.cat).to_string(),
+                x: e.x,
+                y: e.y,
+                room: match e.room {
+                    defreal_dsp::RoomId::Studio => "studio".into(),
+                    defreal_dsp::RoomId::Hallway => "hallway".into(),
+                },
+                active: e.active,
+            })
+            .collect();
+        if let Ok(mut m) = self.emitters_meta.lock() {
+            *m = v;
+        }
     }
 
     /// Snapshot for the UI.
@@ -334,6 +375,15 @@ impl SharedTelemetry {
                 255 => None,
                 v => Some(dog_event_name(v).to_string()),
             },
+            stage_enabled: self.stage_enabled.load(Ordering::Relaxed),
+            door_open: self.stage_door.load(),
+            stage_rms_db: self.stage_rms_db.load(),
+            stage_peak_db: self.stage_peak_db.load(),
+            emitters: self
+                .emitters_meta
+                .lock()
+                .map(|m| m.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -515,4 +565,33 @@ pub struct TelemetrySnapshot {
     pub dog_rms_db: f32,
     pub dog_peak_db: f32,
     pub dog_last_event: Option<String>,
+    pub stage_enabled: bool,
+    /// 0 = closed .. 1 = fully open
+    pub door_open: f32,
+    pub stage_rms_db: f32,
+    pub stage_peak_db: f32,
+    pub emitters: Vec<EmitterTel>,
+}
+
+/// Serializable emitter snapshot for the UI.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EmitterTel {
+    pub id: u32,
+    pub cat: String,
+    pub x: f32,
+    pub y: f32,
+    pub room: String,
+    pub active: bool,
+}
+
+fn emitter_cat_name(c: defreal_dsp::EmitterCat) -> &'static str {
+    match c {
+        defreal_dsp::EmitterCat::Fan => "fan",
+        defreal_dsp::EmitterCat::Vent => "vent",
+        defreal_dsp::EmitterCat::Traffic => "traffic",
+        defreal_dsp::EmitterCat::Keys => "keys",
+        defreal_dsp::EmitterCat::Chair => "chair",
+        defreal_dsp::EmitterCat::Desk => "desk",
+        defreal_dsp::EmitterCat::Footsteps => "footsteps",
+    }
 }

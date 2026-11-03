@@ -103,6 +103,11 @@ pub enum EngineCommand {
     SetMonitor(MonitorConfig),
     /// DefDog: full config replace.
     DogSet(defreal_dsp::DogConfig),
+    /// ROOMLOGIC scene config (enabled/door/room-b profile)
+    SceneSet(defreal_dsp::SceneConfig),
+    EmitterAdd(defreal_dsp::EmitterCfg),
+    EmitterRemove(u32),
+    EmitterUpdate(u32, defreal_dsp::EmitterCfg),
     /// DefDog: Come/Settle/Stay.
     DogCmd(defreal_dsp::DogCommand),
     /// DefDog: deliberate non-bark preview.
@@ -640,6 +645,10 @@ pub struct Pump {
     dog: defreal_dsp::DogEngine,
     dog_cfg: defreal_dsp::DogConfig,
     dog_buf: Vec<f32>,
+    // SOUNDSTAGE: environmental emitters in the shared ROOMLOGIC scene,
+    // program-level bus fans out with the voice to every enabled branch
+    stage: defreal_dsp::SoundStage,
+    stage_buf: Vec<f32>,
     // preallocated scratch (allocated once, reused every tick)
     dev_in: Vec<f32>,
     res48: Vec<f32>,
@@ -693,6 +702,8 @@ impl Pump {
             dog: defreal_dsp::DogEngine::new(INTERNAL_RATE as f32, seed ^ 0xD06),
             dog_cfg: defreal_dsp::DogConfig::default(),
             dog_buf: vec![0.0; block_frames * 4 * 2],
+            stage: defreal_dsp::SoundStage::new(INTERNAL_RATE as f32, seed ^ 0x57A6E),
+            stage_buf: vec![0.0; block_frames * 4 * 2],
             dev_in: vec![0.0; in_chunk],
             res48: Vec::with_capacity(block_frames * 4),
             interleaved: vec![0.0; block_frames * 4 * 2],
@@ -730,6 +741,11 @@ impl Pump {
         &mut self.dog
     }
     #[doc(hidden)]
+    /// SOUNDSTAGE access (config handled via commands; tests use this).
+    pub fn stage_mut(&mut self) -> &mut defreal_dsp::SoundStage {
+        &mut self.stage
+    }
+
     pub fn dog_cfg_mut(&mut self) -> &mut defreal_dsp::DogConfig {
         &mut self.dog_cfg
     }
@@ -847,6 +863,10 @@ impl Pump {
                 self.dog.sync_room(&rp.roomspace);
             }
             self.dog.render(&mut self.dog_buf[..n * 2]);
+            // SOUNDSTAGE: schedule + render the emitter bus (program level,
+            // fans out alongside the voice to both branches).
+            self.stage.update(n as f32 / INTERNAL_RATE as f32);
+            self.stage.render(&mut self.stage_buf[..n * 2]);
             let (dog_main, dog_mon) = match self.dog_cfg.route {
                 defreal_dsp::DogRoute::Both => (true, true),
                 defreal_dsp::DogRoute::Main => (true, false),
@@ -859,8 +879,8 @@ impl Pump {
             for i in 0..n {
                 let dl = self.dog_buf[i * 2];
                 let dr = self.dog_buf[i * 2 + 1];
-                let vl = self.interleaved[i * 2];
-                let vr = self.interleaved[i * 2 + 1];
+                let vl = self.interleaved[i * 2] + self.stage_buf[i * 2];
+                let vr = self.interleaved[i * 2 + 1] + self.stage_buf[i * 2 + 1];
                 let _ = self.mid_l.try_push(vl + if dog_main { dl } else { 0.0 });
                 let _ = self.mid_r.try_push(vr + if dog_main { dr } else { 0.0 });
                 if has_mon {
@@ -890,6 +910,9 @@ impl Pump {
                 let (dr, dp) = self.dog.take_levels();
                 let dd = self.dog.debug();
                 self.telemetry.publish_dog(&dd, dr, dp);
+                let (sr_, sp) = self.stage.take_levels();
+                self.telemetry
+                    .publish_stage(self.stage.door(), self.stage.enabled(), sr_, sp);
             }
         }
 
@@ -971,6 +994,32 @@ pub fn dispatch(cmd: EngineCommand, pump: &mut Pump, telemetry: &Arc<SharedTelem
         }
         EngineCommand::DogCmd(c) => pump.dog.command(c),
         EngineCommand::DogPreview => pump.dog.preview(),
+        EngineCommand::SceneSet(cfg) => {
+            pump.stage.set_enabled(cfg.enabled);
+            pump.stage.set_door(cfg.door_open);
+            pump.dog.set_door(cfg.door_open);
+            let b = defreal_dsp::roomspace::RoomspaceParams {
+                room: cfg.room_b,
+                ..Default::default()
+            };
+            let a = pump.params.load().roomspace.clone();
+            pump.stage.sync_rooms(&a, &b);
+            telemetry.publish_emitters(&pump.stage.info());
+        }
+        EngineCommand::EmitterAdd(cfg) => {
+            pump.stage.add(cfg);
+            telemetry.publish_emitters(&pump.stage.info());
+        }
+        EngineCommand::EmitterRemove(id) => {
+            pump.stage.remove(id);
+            telemetry.publish_emitters(&pump.stage.info());
+        }
+        EngineCommand::EmitterUpdate(id, cfg) => {
+            let ok = pump.stage.emitter_mut(id, |c| *c = cfg.clone());
+            if ok {
+                telemetry.publish_emitters(&pump.stage.info());
+            }
+        }
     }
 }
 
