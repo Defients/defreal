@@ -65,6 +65,8 @@ pub struct AppConfig {
     pub motion_mode: String,
     /// TOUCH-mode return-to-automation duration, seconds
     pub touch_return_s: f32,
+    // defdog (v0.2.0): versioned companion section; defaults = disabled
+    pub dog: defreal_dsp::DogConfig,
 }
 
 fn default_config() -> AppConfig {
@@ -75,6 +77,7 @@ fn default_config() -> AppConfig {
         monitor_gain_db: -18.0,
         motion_mode: "auto".into(),
         touch_return_s: 1.6,
+        dog: defreal_dsp::DogConfig::default(),
         ..Default::default()
     }
 }
@@ -508,6 +511,48 @@ fn monitor_check(input: String, main_out: String, monitor: String) -> Option<Str
     device::monitor_warning(&input, &main_out, &monitor)
 }
 
+// --- defdog (v0.2.0) -----------------------------------------------------------
+
+#[tauri::command]
+fn dog_set(state: State<'_, AppState>, cfg: defreal_dsp::DogConfig) -> Result<(), String> {
+    // validate: clamp volume, sanitize position
+    let mut c = cfg;
+    c.volume_db = c.volume_db.clamp(-48.0, -6.0);
+    if let Some((d, az)) = &mut c.manual_pos {
+        *d = d.clamp(0.15, 3.0);
+        *az = az.clamp(-80.0, 80.0);
+    }
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .try_send(EngineCommand::DogSet(c));
+    Ok(())
+}
+
+#[tauri::command]
+fn dog_command(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    let c = match name.to_ascii_lowercase().as_str() {
+        "come" => defreal_dsp::DogCommand::Come,
+        "settle" => defreal_dsp::DogCommand::Settle,
+        "stay" => defreal_dsp::DogCommand::Stay,
+        other => return Err(format!("unknown dog command {other}")),
+    };
+    state.engine.lock().unwrap().try_send(EngineCommand::DogCmd(c));
+    Ok(())
+}
+
+/// Deliberate, non-bark preview (safe: never emits barks).
+#[tauri::command]
+fn dog_preview(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .try_send(EngineCommand::DogPreview);
+    Ok(())
+}
+
 // --- acoustic snapshots --------------------------------------------------------
 //
 // Snapshots are lightweight spatial memories (position + transition + mode),
@@ -775,6 +820,9 @@ pub fn run() {
             motion_freeze,
             monitor_set,
             monitor_check,
+            dog_set,
+            dog_command,
+            dog_preview,
             snapshots_list,
             snapshot_recall,
             snapshot_save,

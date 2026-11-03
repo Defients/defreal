@@ -101,6 +101,12 @@ pub enum EngineCommand {
     ResetCounters,
     /// Reconfigure the monitor branch (device/gain/mute/enable).
     SetMonitor(MonitorConfig),
+    /// DefDog: full config replace.
+    DogSet(defreal_dsp::DogConfig),
+    /// DefDog: Come/Settle/Stay.
+    DogCmd(defreal_dsp::DogCommand),
+    /// DefDog: deliberate non-bark preview.
+    DogPreview,
 }
 
 pub struct AudioEngine {
@@ -630,6 +636,10 @@ pub struct Pump {
     // monitor (optional second output)
     mon: Option<MonitorBranch>,
     mon_cfg: MonitorConfig,
+    // defdog: independent ambient source, mixed per-branch at fan-out
+    dog: defreal_dsp::DogEngine,
+    dog_cfg: defreal_dsp::DogConfig,
+    dog_buf: Vec<f32>,
     // preallocated scratch (allocated once, reused every tick)
     dev_in: Vec<f32>,
     res48: Vec<f32>,
@@ -680,6 +690,9 @@ impl Pump {
             params,
             mon: None,
             mon_cfg: MonitorConfig::default(),
+            dog: defreal_dsp::DogEngine::new(INTERNAL_RATE as f32, seed ^ 0xD06),
+            dog_cfg: defreal_dsp::DogConfig::default(),
+            dog_buf: vec![0.0; block_frames * 4 * 2],
             dev_in: vec![0.0; in_chunk],
             res48: Vec::with_capacity(block_frames * 4),
             interleaved: vec![0.0; block_frames * 4 * 2],
@@ -709,6 +722,16 @@ impl Pump {
 
     pub fn chain_mut(&mut self) -> &mut DspChain {
         &mut self.chain
+    }
+
+    /// DefDog access (config handled via DogSet command; tests use this).
+    #[doc(hidden)]
+    pub fn dog_mut(&mut self) -> &mut defreal_dsp::DogEngine {
+        &mut self.dog
+    }
+    #[doc(hidden)]
+    pub fn dog_cfg_mut(&mut self) -> &mut defreal_dsp::DogConfig {
+        &mut self.dog_cfg
     }
 
     /// Attach a ready monitor branch (constructed off-thread).
@@ -814,18 +837,36 @@ impl Pump {
             drop(p);
             let proc_us = t0.elapsed().as_micros() as f32;
 
+            // DefDog: update behavior at block rate, render the dog bus.
+            // Same underlying events are fanned into whichever branch(es)
+            // the route selects — never scheduled twice.
+            let speech_level = self.chain.metrics().speech_level;
+            self.dog.update(n as f32 / INTERNAL_RATE as f32, speech_level);
+            {
+                let rp = self.params.load();
+                self.dog.sync_room(&rp.roomspace);
+            }
+            self.dog.render(&mut self.dog_buf[..n * 2]);
+            let (dog_main, dog_mon) = match self.dog_cfg.route {
+                defreal_dsp::DogRoute::Both => (true, true),
+                defreal_dsp::DogRoute::Main => (true, false),
+                defreal_dsp::DogRoute::Monitor => (false, true),
+            };
+
             // ONE processed signal fans out to every branch staging queue.
             // Bounded: a stalled branch drops here, never blocks the others.
             let has_mon = self.mon.is_some();
             for i in 0..n {
-                let l = self.interleaved[i * 2];
-                let r = self.interleaved[i * 2 + 1];
-                let _ = self.mid_l.try_push(l);
-                let _ = self.mid_r.try_push(r);
+                let dl = self.dog_buf[i * 2];
+                let dr = self.dog_buf[i * 2 + 1];
+                let vl = self.interleaved[i * 2];
+                let vr = self.interleaved[i * 2 + 1];
+                let _ = self.mid_l.try_push(vl + if dog_main { dl } else { 0.0 });
+                let _ = self.mid_r.try_push(vr + if dog_main { dr } else { 0.0 });
                 if has_mon {
                     let m = self.mon.as_mut().unwrap();
-                    let _ = m.mid_l.try_push(l);
-                    let _ = m.mid_r.try_push(r);
+                    let _ = m.mid_l.try_push(vl + if dog_mon { dl } else { 0.0 });
+                    let _ = m.mid_r.try_push(vr + if dog_mon { dr } else { 0.0 });
                 }
             }
 
@@ -845,6 +886,11 @@ impl Pump {
             };
             self.telemetry
                 .publish_block(&self.chain.metrics(), self.chain.motion_debug(), &stats, proc_us);
+            {
+                let (dr, dp) = self.dog.take_levels();
+                let dd = self.dog.debug();
+                self.telemetry.publish_dog(&dd, dr, dp);
+            }
         }
 
         // --- main output: mid staging -> device rate -> out rb ---
@@ -918,6 +964,13 @@ pub fn dispatch(cmd: EngineCommand, pump: &mut Pump, telemetry: &Arc<SharedTelem
         EngineCommand::SetMonitor(_) => {
             // handled in run_loop (needs the open-result channel), never here
         }
+        EngineCommand::DogSet(cfg) => {
+            pump.dog_cfg = cfg.clone();
+            let room = pump.params.load().roomspace.clone();
+            pump.dog.configure(&cfg, &room);
+        }
+        EngineCommand::DogCmd(c) => pump.dog.command(c),
+        EngineCommand::DogPreview => pump.dog.preview(),
     }
 }
 

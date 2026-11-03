@@ -90,6 +90,15 @@ pub struct SharedTelemetry {
     mon_channels: AtomicU8,
     /// device name + last error; UI-thread only, never touched in RT callbacks
     pub mon_meta: std::sync::Mutex<MonitorMeta>,
+    // defdog (ambient canine source)
+    dog_enabled: AtomicBool,
+    dog_state: AtomicU8,
+    dog_distance: AtomicF32,
+    dog_azimuth: AtomicF32,
+    dog_moving: AtomicBool,
+    dog_rms_db: AtomicF32,
+    dog_peak_db: AtomicF32,
+    dog_last_event: AtomicU8,
 }
 
 /// Stringy monitor info that can't live in atomics.
@@ -186,6 +195,14 @@ impl SharedTelemetry {
             mon_rate: AtomicF32(AtomicU64::new(0)),
             mon_channels: AtomicU8::new(0),
             mon_meta: std::sync::Mutex::new(MonitorMeta::default()),
+            dog_enabled: AtomicBool::new(false),
+            dog_state: AtomicU8::new(0),
+            dog_distance: AtomicF32(AtomicU64::new((2.2f32).to_bits() as u64)),
+            dog_azimuth: AtomicF32(AtomicU64::new(0)),
+            dog_moving: AtomicBool::new(false),
+            dog_rms_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
+            dog_peak_db: AtomicF32(AtomicU64::new((-100.0f32).to_bits() as u64)),
+            dog_last_event: AtomicU8::new(255),
         }
     }
 
@@ -235,6 +252,19 @@ impl SharedTelemetry {
         self.motion_age.store(dbg.seconds_since_transition);
         self.motion_manual.store(dbg.manual, Ordering::Relaxed);
         self.motion_pending.store(dbg.pending.map(motion_state_u8).unwrap_or(255), Ordering::Relaxed);
+    }
+
+    /// Per-tick dog stats (processing thread only).
+    pub fn publish_dog(&self, d: &defreal_dsp::DogDebug, rms_db: f32, peak_db: f32) {
+        self.dog_enabled.store(d.enabled, Ordering::Relaxed);
+        self.dog_state.store(dog_state_u8(d.state), Ordering::Relaxed);
+        self.dog_distance.store(d.distance_m);
+        self.dog_azimuth.store(d.azimuth_deg);
+        self.dog_moving.store(d.moving, Ordering::Relaxed);
+        self.dog_rms_db.store(rms_db);
+        self.dog_peak_db.store(peak_db);
+        self.dog_last_event
+            .store(d.last_event.map(dog_event_u8).unwrap_or(255), Ordering::Relaxed);
     }
 
     /// Snapshot for the UI.
@@ -293,6 +323,17 @@ impl SharedTelemetry {
                 .map(|m| m.device.clone())
                 .unwrap_or_default(),
             monitor_error: self.mon_meta.lock().ok().and_then(|m| m.error.clone()),
+            dog_enabled: self.dog_enabled.load(Ordering::Relaxed),
+            dog_state: dog_state_name(self.dog_state.load(Ordering::Relaxed)),
+            dog_distance_m: self.dog_distance.load(),
+            dog_azimuth_deg: self.dog_azimuth.load(),
+            dog_moving: self.dog_moving.load(Ordering::Relaxed),
+            dog_rms_db: self.dog_rms_db.load(),
+            dog_peak_db: self.dog_peak_db.load(),
+            dog_last_event: match self.dog_last_event.load(Ordering::Relaxed) {
+                255 => None,
+                v => Some(dog_event_name(v).to_string()),
+            },
         }
     }
 
@@ -351,6 +392,58 @@ fn motion_state_u8(s: MotionState) -> u8 {
         MotionState::TurnAside => 3,
         MotionState::Reposition => 4,
         MotionState::ReturnToNeutral => 5,
+    }
+}
+
+fn dog_state_u8(s: defreal_dsp::DogState) -> u8 {
+    match s {
+        defreal_dsp::DogState::Resting => 0,
+        defreal_dsp::DogState::Wandering => 1,
+        defreal_dsp::DogState::Investigating => 2,
+        defreal_dsp::DogState::Attentive => 3,
+        defreal_dsp::DogState::Vocalizing => 4,
+        defreal_dsp::DogState::Settling => 5,
+    }
+}
+fn dog_state_name(v: u8) -> &'static str {
+    match v {
+        1 => "wandering",
+        2 => "investigating",
+        3 => "attentive",
+        4 => "vocalizing",
+        5 => "settling",
+        _ => "resting",
+    }
+}
+fn dog_event_u8(e: defreal_dsp::DogEvent) -> u8 {
+    match e {
+        defreal_dsp::DogEvent::Breath => 0,
+        defreal_dsp::DogEvent::Pant => 1,
+        defreal_dsp::DogEvent::Sniff => 2,
+        defreal_dsp::DogEvent::Whine => 3,
+        defreal_dsp::DogEvent::Sigh => 4,
+        defreal_dsp::DogEvent::Step => 5,
+        defreal_dsp::DogEvent::Collar => 6,
+        defreal_dsp::DogEvent::SettleDown => 7,
+        defreal_dsp::DogEvent::Move => 8,
+        defreal_dsp::DogEvent::Bark => 9,
+        defreal_dsp::DogEvent::BarkCluster => 10,
+    }
+}
+fn dog_event_name(v: u8) -> &'static str {
+    match v {
+        0 => "breath",
+        1 => "pant",
+        2 => "sniff",
+        3 => "whine",
+        4 => "sigh",
+        5 => "step",
+        6 => "collar",
+        7 => "settle",
+        8 => "move",
+        9 => "bark",
+        10 => "bark cluster",
+        _ => "?",
     }
 }
 
@@ -413,4 +506,13 @@ pub struct TelemetrySnapshot {
     pub monitor_channels: u8,
     pub monitor_device: String,
     pub monitor_error: Option<String>,
+    // defdog
+    pub dog_enabled: bool,
+    pub dog_state: &'static str,
+    pub dog_distance_m: f32,
+    pub dog_azimuth_deg: f32,
+    pub dog_moving: bool,
+    pub dog_rms_db: f32,
+    pub dog_peak_db: f32,
+    pub dog_last_event: Option<String>,
 }

@@ -2,6 +2,7 @@ import { useStore } from "../store";
 import { Knob, Meter } from "./widgets";
 import { Stage, MotionHistory } from "./Stage";
 import { ModulePanels } from "./Modules";
+import { DogPanel } from "./DogPanel";
 
 export function PerformTab() {
   const params = useStore((s) => s.params);
@@ -102,11 +103,14 @@ export function PerformTab() {
 
       {/* right: viz + modules */}
       <div className="space-y-3">
-        <div className="panel p-4">
-          <Stage />
-          <div className="mt-2">
-            <MotionHistory />
+        <div className="grid grid-cols-1 xl:grid-cols-[1fr_320px] gap-3">
+          <div className="panel p-4">
+            <Stage />
+            <div className="mt-2">
+              <MotionHistory />
+            </div>
           </div>
+          <DogPanel />
         </div>
         <ModulePanels />
       </div>

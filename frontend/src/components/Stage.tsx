@@ -28,7 +28,7 @@ function toXY(d: number, az: number, cx: number, cy: number, scale: number) {
 /** Interactive Live Presence Stage: draggable speaker vs. fixed mic. */
 export function Stage() {
   const ref = useRef<HTMLCanvasElement>(null);
-  const dragRef = useRef<{ active: boolean; lastSend: number }>({ active: false, lastSend: 0 });
+  const dragRef = useRef<{ active: boolean; lastSend: number; dog: boolean }>({ active: false, lastSend: 0, dog: false });
   const posRef = useRef({ d: 0.32, az: 0, f: 0 });
   const t = useStore((s) => s.telemetry);
   const motionMode = useStore((s) => s.motionMode);
@@ -57,8 +57,12 @@ export function Stage() {
     const now = performance.now();
     if (now - dragRef.current.lastSend < THROTTLE_MS) return;
     dragRef.current.lastSend = now;
-    stageDragMove(d, az);
-    api.motionSetManual(d, az, posRef.current.f).catch(() => {});
+    if (dragRef.current.dog) {
+      useStore.getState().dogDragMove(d, az);
+    } else {
+      stageDragMove(d, az);
+      api.motionSetManual(d, az, posRef.current.f).catch(() => {});
+    }
   };
 
   const pointerPos = (e: React.PointerEvent) => {
@@ -70,8 +74,24 @@ export function Stage() {
 
   const onPointerDown = (e: React.PointerEvent) => {
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    const st = useStore.getState();
+    const r = ref.current!.getBoundingClientRect();
+    const px = ((e.clientX - r.left) / r.width) * W;
+    const py = ((e.clientY - r.top) / r.height) * H;
+    // drag arbitration: near the dog marker -> move the dog, else speaker
+    const tel = st.telemetry;
+    let dogHit = false;
+    if (st.dog.enabled && tel?.dog_enabled) {
+      const [dx2, dy2] = toXY(tel.dog_distance_m, tel.dog_azimuth_deg, cx, cy, scale);
+      dogHit = Math.hypot(px - dx2, py - dy2) < 20;
+    }
+    dragRef.current.dog = dogHit;
     dragRef.current.active = true;
-    stageDragStart();
+    if (dogHit) {
+      st.dogDragStart();
+    } else {
+      stageDragStart();
+    }
     const p = pointerPos(e);
     posRef.current.d = p.d;
     posRef.current.az = p.az;
@@ -86,8 +106,14 @@ export function Stage() {
   };
   const onPointerUp = () => {
     if (!dragRef.current.active) return;
+    const wasDog = dragRef.current.dog;
     dragRef.current.active = false;
-    stageDragEnd();
+    dragRef.current.dog = false;
+    if (wasDog) {
+      useStore.getState().dogDragEnd();
+    } else {
+      stageDragEnd();
+    }
   };
   const nudge = (dd: number, daz: number) => {
     posRef.current.d = Math.max(D_MIN, Math.min(D_MAX, posRef.current.d + dd));
@@ -179,6 +205,47 @@ export function Stage() {
       ctx.moveTo(sx, sy);
       ctx.lineTo(sx + Math.sin(fAng) * 13, sy - Math.cos(fAng) * 13);
       ctx.stroke();
+
+      // dog marker (if enabled): amber paw-dot, size-scaled
+      if (st.dog.enabled && tel?.dog_enabled) {
+        const dd = dragRef.current.dog && st.dogPos ? st.dogPos.d : tel.dog_distance_m;
+        const daz = dragRef.current.dog && st.dogPos ? st.dogPos.az : tel.dog_azimuth_deg;
+        const [gx, gy] = toXY(dd, daz, cx, cy, scale);
+        const rDog = st.dog.size === "Small" ? 6 : st.dog.size === "Large" ? 11 : 8;
+        const dg = ctx.createRadialGradient(gx, gy, 0, gx, gy, rDog * 2.4);
+        dg.addColorStop(0, "rgba(232,176,74,0.45)");
+        dg.addColorStop(1, "rgba(232,176,74,0)");
+        ctx.fillStyle = dg;
+        ctx.beginPath();
+        ctx.arc(gx, gy, rDog * 2.4, 0, Math.PI * 2);
+        ctx.fill();
+        // paw-ish: body circle + toe dots
+        ctx.fillStyle = "#e8b04a";
+        ctx.beginPath();
+        ctx.arc(gx, gy, rDog, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = "#0a0a12";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        for (const [ox, oy] of [[-rDog * 0.7, -rDog * 0.9], [0, -rDog * 1.1], [rDog * 0.7, -rDog * 0.9]]) {
+          ctx.beginPath();
+          ctx.arc(gx + ox, gy + oy, rDog * 0.28, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.fillStyle = "rgba(232,176,74,0.9)";
+        ctx.font = "9px monospace";
+        const dstate = tel.dog_moving ? "walk" : tel.dog_state;
+        ctx.fillText(`${st.dog.size.toLowerCase()} · ${dstate}`, gx + rDog + 4, gy + 3);
+        // motion path to target
+        if (tel.dog_moving) {
+          ctx.strokeStyle = "rgba(232,176,74,0.25)";
+          ctx.setLineDash([2, 4]);
+          ctx.beginPath();
+          ctx.arc(gx, gy, rDog + 4, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
 
       // mic (fixed)
       ctx.save();
@@ -293,7 +360,7 @@ export function Stage() {
         }}
       />
       <div className="flex justify-between text-[9px] text-faint mt-1">
-        <span>drag speaker · arrows nudge · Home resets</span>
+        <span>drag speaker (cyan) or dog (amber) · arrows nudge · Home resets</span>
         <span>
           {t ? `${(t.motion_distance_m ?? 0).toFixed(2)} m · ${(t.motion_azimuth_deg ?? 0).toFixed(0)}°` : "—"}
         </span>

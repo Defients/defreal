@@ -6,6 +6,7 @@
 pub mod ambience;
 pub mod biquad;
 pub mod chain;
+pub mod dog;
 pub mod delay;
 pub mod dynamics;
 pub mod envelope;
@@ -26,5 +27,9 @@ pub mod smooth;
 pub mod vad;
 
 pub use chain::{ChainParams, DspChain, EngineMetrics, MotionDebug};
+pub use dog::{
+    DogActivity, DogCommand, DogConfig, DogDebug, DogEngine, DogEvent, DogRoute, DogSize, DogState,
+    DogTemperament, MANIFEST,
+};
 pub use motion::{MotionState, PositionState};
 pub use preset::Preset;

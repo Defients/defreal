@@ -56,6 +56,15 @@ export interface Telemetry {
   monitor_channels: number;
   monitor_device: string;
   monitor_error: string | null;
+  // defdog (v0.2.0)
+  dog_enabled: boolean;
+  dog_state: string;
+  dog_distance_m: number;
+  dog_azimuth_deg: number;
+  dog_moving: boolean;
+  dog_rms_db: number;
+  dog_peak_db: number;
+  dog_last_event: string | null;
 }
 
 export interface DeviceInfo {
@@ -172,6 +181,23 @@ export interface AppConfig {
   monitor_muted: boolean;
   motion_mode: string;
   touch_return_s: number;
+  dog: DogConfig;
+}
+
+export type DogSize = "Small" | "Medium" | "Large";
+export type DogTemperament = "Calm" | "Curious" | "Playful";
+export type DogActivity = "Rare" | "Occasional" | "Frequent";
+export type DogRoute = "Both" | "Main" | "Monitor";
+
+export interface DogConfig {
+  enabled: boolean;
+  size: DogSize;
+  temperament: DogTemperament;
+  activity: DogActivity;
+  volume_db: number;
+  allow_bark: boolean;
+  route: DogRoute;
+  manual_pos: [number, number] | null;
 }
 
 export interface RenderReport {

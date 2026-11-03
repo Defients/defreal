@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "defreal-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "defreal-audio",
  "defreal-dsp",
@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "defreal-audio"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "atomic_float",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "defreal-dsp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hound",
  "serde",

@@ -425,3 +425,106 @@ fn move_then_release_sequences() {
         "move_then_release target lost: {d:?}"
     );
 }
+
+// --- defdog routing tests (v0.2.0) --------------------------------------------
+
+fn dog_cfg(f: impl Fn(&mut defreal_dsp::DogConfig)) -> defreal_dsp::DogConfig {
+    let mut c = defreal_dsp::DogConfig { enabled: true, volume_db: -12.0, ..Default::default() };
+    f(&mut c);
+    c
+}
+
+fn drive_dog(r: &mut Rig, secs_input: usize) {
+    // silence input; dog events carry the signal
+    r.pump.dog_mut().preview();
+    push_all(r, &vec![0.0f32; secs_input]);
+    for _ in 0..secs_input / 100 {
+        r.pump.dog_mut().preview();
+        r.pump.tick();
+    }
+    for _ in 0..200 { r.pump.tick(); }
+}
+
+#[test]
+fn dog_audio_reaches_main_when_enabled() {
+    use defreal_audio::engine::dispatch;
+    let mut r = rig(48000, 48000);
+    dispatch(defreal_audio::EngineCommand::DogSet(dog_cfg(|c| c.route = defreal_dsp::DogRoute::Both)), &mut r.pump, &r.telemetry);
+    drive_dog(&mut r, 48000);
+    let mut out = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { out.push(s); }
+    assert!(rms(&out) > 1e-4, "enabled dog silent on main: {}", rms(&out));
+}
+
+#[test]
+fn dog_monitor_only_keeps_main_dry() {
+    use defreal_audio::engine::dispatch;
+    let (mon_prod, mut mon_cons) = HeapRb::<f32>::new(96000).split();
+    let mut r = rig(48000, 48000);
+    r.pump.attach_monitor(defreal_audio::MonitorBranch::for_test(mon_prod, 48000, 2, 0.0).unwrap());
+    r.pump.set_monitor_cfg(defreal_audio::MonitorConfig {
+        enabled: true, device: None, gain_db: 0.0, muted: false,
+    });
+    dispatch(defreal_audio::EngineCommand::DogSet(dog_cfg(|c| c.route = defreal_dsp::DogRoute::Monitor)),
+        &mut r.pump, &r.telemetry);
+    drive_dog(&mut r, 48000);
+    let mut main = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { main.push(s); }
+    let mut mon = Vec::new();
+    while let Some(s) = mon_cons.try_pop() { mon.push(s); }
+    assert!(mon.len() > 1000, "monitor got nothing");
+    let mr = rms(&mon);
+    let rr = rms(&main);
+    assert!(mr > rr * 10.0 || rr < 1e-4,
+        "dog leaked to main under Monitor route: main {rr} mon {mr}");
+}
+
+#[test]
+fn dog_main_only_keeps_monitor_dry() {
+    use defreal_audio::engine::dispatch;
+    let (mon_prod, mut mon_cons) = HeapRb::<f32>::new(96000).split();
+    let mut r = rig(48000, 48000);
+    r.pump.attach_monitor(defreal_audio::MonitorBranch::for_test(mon_prod, 48000, 2, 0.0).unwrap());
+    r.pump.set_monitor_cfg(defreal_audio::MonitorConfig {
+        enabled: true, device: None, gain_db: 0.0, muted: false,
+    });
+    dispatch(defreal_audio::EngineCommand::DogSet(dog_cfg(|c| c.route = defreal_dsp::DogRoute::Main)),
+        &mut r.pump, &r.telemetry);
+    drive_dog(&mut r, 48000);
+    let mut main = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { main.push(s); }
+    let mut mon = Vec::new();
+    while let Some(s) = mon_cons.try_pop() { mon.push(s); }
+    assert!(main.len() > 1000);
+    let rr = rms(&main);
+    let mr = rms(&mon);
+    assert!(rr > mr * 10.0 || mr < 1e-4,
+        "dog leaked to monitor under Main route: main {rr} mon {mr}");
+}
+
+#[test]
+fn disabled_dog_produces_no_audio() {
+    use defreal_audio::engine::dispatch;
+    let mut r = rig(48000, 48000);
+    // explicitly disable
+    dispatch(defreal_audio::EngineCommand::DogSet(defreal_dsp::DogConfig::default()), &mut r.pump, &r.telemetry);
+    r.pump.dog_mut().preview(); // preview with volume 0 => silent
+    push_all(&mut r, &vec![0.0f32; 24000]);
+    for _ in 0..300 { r.pump.tick(); }
+    let mut out = Vec::new();
+    while let Some(s) = r.out_cons.try_pop() { out.push(s); }
+    // silence input + disabled dog => near-silence (ambience ~-54dB)
+    assert!(rms(&out) < 0.02, "disabled dog audible: {}", rms(&out));
+}
+
+#[test]
+fn dog_set_command_surfaces_in_telemetry() {
+    use defreal_audio::engine::dispatch;
+    let mut r = rig(48000, 48000);
+    dispatch(defreal_audio::EngineCommand::DogSet(dog_cfg(|_| {})), &mut r.pump, &r.telemetry);
+    push_all(&mut r, &vec![0.0f32; 4800]);
+    for _ in 0..10 { r.pump.tick(); }
+    let s = r.telemetry.snapshot(None);
+    assert!(s.dog_enabled, "dog enabled not in telemetry");
+    assert_eq!(s.dog_state, "resting");
+}

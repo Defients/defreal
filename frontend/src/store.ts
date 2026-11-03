@@ -4,6 +4,7 @@ import type {
   AppConfig,
   ChainParams,
   DeviceInfo,
+  DogConfig,
   MotionMode,
   PresetMeta,
   SnapshotMeta,
@@ -51,6 +52,11 @@ interface DefRealStore {
   stageDragging: boolean;
   stagePos: { d: number; az: number } | null; // live drag position (UI-side)
 
+  // defdog (v0.2.0)
+  dog: DogConfig;
+  dogDragging: boolean;
+  dogPos: { d: number; az: number } | null; // live dog drag position (UI-side)
+
   // motion history (last ~30s, ~15hz)
   distanceHistory: DistanceSample[];
 
@@ -87,6 +93,11 @@ interface DefRealStore {
   stageDragStart: () => void;
   stageDragMove: (d: number, az: number) => void;
   stageDragEnd: () => Promise<void>;
+  setDog: (patch: Partial<DogConfig>) => Promise<void>;
+  dogCmd: (name: "come" | "settle" | "stay") => Promise<void>;
+  dogDragStart: () => void;
+  dogDragMove: (d: number, az: number) => void;
+  dogDragEnd: () => Promise<void>;
   acousticAction: (name: string) => Promise<void>;
   recallSnapshot: (name: string) => Promise<void>;
   saveSnapshot: (name: string, transitionS: number, modeAfter: string) => Promise<void>;
@@ -123,6 +134,18 @@ export const useStore = create<DefRealStore>((set, get) => ({
   snapshots: [],
   stageDragging: false,
   stagePos: null,
+  dog: {
+    enabled: false,
+    size: "Medium",
+    temperament: "Calm",
+    activity: "Rare",
+    volume_db: -24,
+    allow_bark: false,
+    route: "Both",
+    manual_pos: null,
+  },
+  dogDragging: false,
+  dogPos: null,
   distanceHistory: [],
   activeTab: "perform",
   toast: null,
@@ -172,6 +195,11 @@ export const useStore = create<DefRealStore>((set, get) => ({
         monitorMuted: cfg.monitor_muted || false,
         motionMode: (cfg.motion_mode as MotionMode) || "auto",
         touchReturnS: cfg.touch_return_s || 1.6,
+        dog: cfg.dog ?? {
+          enabled: false, size: "Medium", temperament: "Calm",
+          activity: "Rare", volume_db: -24, allow_bark: false,
+          route: "Both", manual_pos: null,
+        },
       });
       if (cfg.last_preset) {
         await loadPreset(cfg.last_preset);
@@ -388,6 +416,34 @@ export const useStore = create<DefRealStore>((set, get) => ({
     }
   },
 
+  setDog: async (patch) => {
+    const dog = { ...get().dog, ...patch };
+    set({ dog });
+    // manual_pos handled by dogDrag* actions; keep engine in sync for the rest
+    await api.dogSet(dog).catch((e) => set({ toast: { text: String(e), kind: "error" } }));
+    await get().persistConfig();
+  },
+
+  dogCmd: async (name) => {
+    await api.dogCommand(name).catch((e) => set({ toast: { text: String(e), kind: "error" } }));
+  },
+
+  dogDragStart: () => {
+    set({ dogDragging: true });
+  },
+
+  dogDragMove: (d, az) => {
+    set({ dogPos: { d, az } });
+    const dog = { ...get().dog, manual_pos: [d, az] as [number, number] };
+    set({ dog });
+    api.dogSet(dog).catch(() => {});
+  },
+
+  dogDragEnd: async () => {
+    set({ dogDragging: false });
+    await get().persistConfig();
+  },
+
   acousticAction: async (name) => {
     const s = get();
     // deterministic poses on the shared spatial state
@@ -482,6 +538,7 @@ export const useStore = create<DefRealStore>((set, get) => ({
       monitor_muted: s.monitorMuted,
       motion_mode: s.motionMode,
       touch_return_s: s.touchReturnS,
+      dog: s.dog,
     };
     await api.configSave(cfg).catch(() => {});
   },
